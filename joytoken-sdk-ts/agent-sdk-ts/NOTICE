@@ -1,5 +1,0 @@
-JoyToken Agent SDK for TypeScript
-
-Copyright 2026 JoyToken project contributors.
-
-This distribution depends on the separately published JoyToken Client SDK for TypeScript and does not bundle third-party runtime dependencies.

@@ -1,6 +1,0 @@
-packages:
-  - "client-sdk-ts"
-  - "agent-sdk-ts"
-  - "example"
-
-linkWorkspacePackages: true
