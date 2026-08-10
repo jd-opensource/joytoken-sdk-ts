@@ -1,4 +1,6 @@
 export type ChatRole = "system" | "user" | "assistant" | "tool";
+/** The only model value accepted by JoyToken requests. */
+export type JoyTokenModel = "auto";
 export interface ChatMessage {
     role: ChatRole;
     content?: string | Array<Record<string, unknown>> | null;
@@ -24,7 +26,7 @@ export interface ChatTool {
     };
 }
 export interface ChatCompletionRequest {
-    model: string;
+    model: JoyTokenModel;
     messages: ChatMessage[];
     stream?: false;
     temperature?: number;
@@ -97,7 +99,7 @@ export interface ResponseTool {
     [key: string]: unknown;
 }
 export interface ResponseRequest {
-    model: string;
+    model: JoyTokenModel;
     input: string | ResponseInputItem[];
     instructions?: string;
     stream?: false;
@@ -154,7 +156,7 @@ export interface ResponseStreamEvent {
     [key: string]: unknown;
 }
 export interface ImageGenerationRequest {
-    model: string;
+    model: JoyTokenModel;
     prompt: string;
     n?: number;
     quality?: string;
@@ -181,16 +183,43 @@ export interface ImageGenerationResponse {
     [key: string]: unknown;
 }
 export interface ModelInfo {
-    id: string;
-    name?: string;
+    modelId?: string;
+    modelKey?: string;
+    displayName?: string;
+    alias?: string;
+    tier?: string;
+    tags?: string[];
     description?: string;
-    context_length?: number;
-    pricing?: Record<string, unknown>;
+    customerInputMtok?: number;
+    customerOutputMtok?: number;
+    customerCachereadMtok?: number;
+    customerCachewriteMtok?: number;
+    customerImageInputMtok?: string;
+    customerImageOutputMtok?: string;
+    customerImageCachedInputMtok?: string;
+    provider?: string;
+    featureTags?: string[];
+    scenarioTags?: string[];
+    mciScore?: number;
     [key: string]: unknown;
 }
+/** Supported languages for localized model descriptions. */
+export type ModelLocale = "zh" | "en";
+/** Options for the public model catalog request. */
+export interface ListModelsOptions {
+    /**
+     * Response language for model descriptions. When omitted, the API defaults
+     * to English.
+     */
+    locale?: ModelLocale;
+}
 export interface ModelListResponse {
+    code?: number;
+    message?: string;
     object?: string;
-    data: ModelInfo[];
+    data: {
+        models: ModelInfo[];
+    };
     [key: string]: unknown;
 }
 export interface CatalogOption {
@@ -255,7 +284,7 @@ export interface MessageTool {
     input_schema: Record<string, unknown>;
 }
 export interface MessageRequest {
-    model: string;
+    model: JoyTokenModel;
     max_tokens: number;
     messages: MessageParam[];
     system?: string | MessageContentBlock[];

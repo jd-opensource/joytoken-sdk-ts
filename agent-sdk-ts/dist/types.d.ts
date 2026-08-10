@@ -4,7 +4,6 @@ export interface ModelProvider {
     complete(request: ModelRequest): Promise<ModelResponse>;
 }
 export interface ModelRequest {
-    model: string;
     messages: ChatMessage[];
     tools?: ChatTool[];
     temperature?: number;
@@ -30,7 +29,6 @@ export interface ToolExecutionContext {
 }
 export interface AgentOptions {
     model: ModelProvider;
-    modelName?: string;
     system?: string;
     tools?: AgentTool[];
     stopWhen?: StopCondition[];

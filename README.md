@@ -94,6 +94,10 @@ The default endpoint is `https://api.joytokens.ai`. Requests time out after 60 s
 
 Authenticated model calls, model metadata and pricing requests fail locally with a clear error when no API key is configured. `models.list()` remains the unauthenticated catalog call.
 
+All model requests require `model: "auto"`; concrete model IDs are rejected locally by the SDK.
+
+Model description language is selected per `models.list()` call, not in global client configuration. Pass `{ locale: "zh" }` or `{ locale: "en" }`; omitting it defaults to English. The SDK preserves the API response envelope, so catalog entries are in `response.data.models`.
+
 ## Repository development
 
 The following commands are for contributors working from a source checkout. The repository already contains the root `package.json`, workspace manifest, and lockfile:
@@ -120,7 +124,6 @@ The live example calls JoyToken and requires a real API key:
 ```bash
 cd example
 export JOY_TOKEN_API_KEY="..."
-export JOY_TOKEN_MODEL="auto"
 pnpm live
 ```
 

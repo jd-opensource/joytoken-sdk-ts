@@ -57,7 +57,7 @@ test("JoyToken provider sends OpenAI Chat Completions requests", async () => {
     openAIBaseUrl: `${baseUrl}/openai/v1`,
     protocol: "openai",
   });
-  const response = await provider.complete({ model: "auto", messages: [{ role: "user", content: "hello" }] });
+  const response = await provider.complete({ messages: [{ role: "user", content: "hello" }] });
 
   assert.equal(lastRequest?.url, "/openai/v1/chat/completions");
   assert.equal(response.message.content, "hello");
@@ -72,7 +72,6 @@ test("JoyToken provider converts Agent messages and tools to Anthropic Messages"
     protocol: "anthropic",
   });
   const request: ModelRequest = {
-    model: "auto",
     messages: [
       { role: "system", content: "Be concise" },
       { role: "user", content: "Look up 42" },

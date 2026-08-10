@@ -1,4 +1,4 @@
-import type { ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamRequest, ImageGenerationRequest, ImageGenerationResponse, JoyTokenClientOptions, MessageRequest, MessageResponse, MessageStreamEvent, MessageStreamRequest, ModelListResponse, ModelMetadataResponse, PricingResponse, Response as JoyTokenResponse, ResponseRequest, ResponseStreamEvent, ResponseStreamRequest } from "./types.js";
+import type { ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamRequest, ImageGenerationRequest, ImageGenerationResponse, JoyTokenClientOptions, ListModelsOptions, MessageRequest, MessageResponse, MessageStreamEvent, MessageStreamRequest, ModelListResponse, ModelMetadataResponse, PricingResponse, Response as JoyTokenResponse, ResponseRequest, ResponseStreamEvent, ResponseStreamRequest } from "./types.js";
 export declare class JoyTokenAPIError extends Error {
     readonly status: number;
     readonly requestId?: string;
@@ -27,7 +27,7 @@ export declare class JoyTokenClient {
         };
     };
     readonly models: {
-        list: () => Promise<ModelListResponse>;
+        list: (options?: ListModelsOptions) => Promise<ModelListResponse>;
         meta: () => Promise<ModelMetadataResponse>;
     };
     readonly images: {
@@ -56,6 +56,7 @@ export declare class JoyTokenClient {
     private getModelMetadata;
     private getPricing;
     private requireAPIKey;
+    private requireAutoModel;
     private requestJSON;
     private requestRaw;
     private headers;

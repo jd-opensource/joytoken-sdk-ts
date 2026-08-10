@@ -37,7 +37,7 @@ const result = await agent.run("Summarize record 42");
 console.log(result.finalText);
 ```
 
-JoyToken routes model requests. Tool execution, state, and approval logic remain in your application.
+JoyToken Agent SDK always sends `model: "auto"`; model IDs cannot be selected through the Agent SDK. Tool execution, state, and approval logic remain in your application.
 
 Every run has a hard eight-step limit by default. Set `maxSteps` per run or add `stopWhen` conditions for tool-call or cost budgets, and handle provider and tool errors in your application.
 

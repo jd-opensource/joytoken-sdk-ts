@@ -10,7 +10,7 @@ before(async () => {
   const server = createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/api/v1/models") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ object: "list", data: [{ id: "joy/mock" }] }));
+      res.end(JSON.stringify({ object: "list", data: { models: [{ modelId: "auto", modelKey: "auto", displayName: "auto", alias: "auto" }] } }));
       return;
     }
 
@@ -80,7 +80,7 @@ before(async () => {
         return;
       }
 
-      res.writeHead(200, { "Content-Type": "application/json", "X-DAOE-Used-Model": "joy/mock" });
+      res.writeHead(200, { "Content-Type": "application/json", "X-DAOE-Used-Model": "auto" });
       res.end(
         JSON.stringify({
           id: "chatcmpl_test",
@@ -96,9 +96,9 @@ before(async () => {
       const payload = JSON.parse(body) as { stream?: boolean };
       if (payload.stream) {
         res.writeHead(200, { "Content-Type": "text/event-stream" });
-        res.write('event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test","object":"response","status":"in_progress","model":"joy/mock"}}\n\n');
+        res.write('event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test","object":"response","status":"in_progress","model":"auto"}}\n\n');
         res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":1,"delta":"hello"}\n\n');
-        res.write('event: response.completed\ndata: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_test","object":"response","status":"completed","model":"joy/mock","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}\n\n');
+        res.write('event: response.completed\ndata: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_test","object":"response","status":"completed","model":"auto","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}\n\n');
         res.end();
         return;
       }
@@ -107,7 +107,7 @@ before(async () => {
         id: "resp_test",
         object: "response",
         status: "completed",
-        model: "joy/mock",
+        model: "auto",
         output: [{ type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "hello" }] }],
         usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
       }));
@@ -117,7 +117,7 @@ before(async () => {
     if (req.method === "POST" && req.url === "/openai/v1/images/generations") {
       const body = await readBody(req);
       const payload = JSON.parse(body) as { model?: string; prompt?: string; size?: string };
-      assert.equal(payload.model, "joy/image-mock");
+      assert.equal(payload.model, "auto");
       assert.equal(payload.prompt, "A JoyToken logo on a black background");
       assert.equal(payload.size, "1024x1024");
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -135,7 +135,7 @@ before(async () => {
 
       if (payload.stream) {
         res.writeHead(200, { "Content-Type": "text/event-stream" });
-        res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"joy/mock","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n');
+        res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"auto","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n');
         res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n');
         res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
         res.end();
@@ -149,7 +149,7 @@ before(async () => {
           type: "message",
           role: "assistant",
           content: [{ type: "text", text: "hello" }],
-          model: "joy/mock",
+          model: "auto",
           stop_reason: "end_turn",
           stop_sequence: null,
           usage: { input_tokens: 1, output_tokens: 1 },
@@ -176,7 +176,7 @@ after(async () => {
 test("creates chat completions", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
   const response = await client.chat.completions.create({
-    model: "joy/mock",
+    model: "auto",
     messages: [{ role: "user", content: "hello" }],
   });
 
@@ -187,7 +187,7 @@ test("streams chat completions", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
   const chunks = [];
   for await (const chunk of client.chat.completions.stream({
-    model: "joy/mock",
+    model: "auto",
     messages: [{ role: "user", content: "hello" }],
   })) {
     chunks.push(chunk);
@@ -199,7 +199,7 @@ test("streams chat completions", async () => {
 test("creates Responses", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
   const response = await client.responses.create({
-    model: "joy/mock",
+    model: "auto",
     input: "hello",
     instructions: "Be concise",
     max_output_tokens: 128,
@@ -212,7 +212,7 @@ test("creates Responses", async () => {
 test("streams Responses events", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
   const events = [];
-  for await (const event of client.responses.stream({ model: "joy/mock", input: "hello" })) {
+  for await (const event of client.responses.stream({ model: "auto", input: "hello" })) {
     events.push(event);
   }
 
@@ -224,7 +224,7 @@ test("streams Responses events", async () => {
 test("generates images", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
   const response = await client.images.generate({
-    model: "joy/image-mock",
+    model: "auto",
     prompt: "A JoyToken logo on a black background",
     size: "1024x1024",
   });
@@ -236,7 +236,7 @@ test("generates images", async () => {
 test("creates Anthropic messages", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl });
   const response = await client.messages.create({
-    model: "joy/mock",
+    model: "auto",
     max_tokens: 128,
     messages: [{ role: "user", content: "hello" }],
   });
@@ -248,7 +248,7 @@ test("streams Anthropic messages", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl });
   const events = [];
   for await (const event of client.messages.stream({
-    model: "joy/mock",
+    model: "auto",
     max_tokens: 128,
     messages: [{ role: "user", content: "hello" }],
   })) {
@@ -262,7 +262,76 @@ test("streams Anthropic messages", async () => {
 test("lists models", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
   const models = await client.models.list();
-  assert.equal(models.data[0]?.id, "joy/mock");
+  assert.equal(models.data.models[0]?.modelId, "auto");
+});
+
+test("rejects concrete model IDs before sending a request", async () => {
+  let requests = 0;
+  const client = new JoyTokenClient({
+    apiKey: "test-key",
+    fetch: async () => {
+      requests += 1;
+      throw new Error("unexpected request");
+    },
+  });
+  const concreteModel = "unsupported-model" as "auto";
+
+  const calls = [
+    () => client.chat.completions.create({ model: concreteModel, messages: [] }),
+    () => client.chat.completions.stream({ model: concreteModel, messages: [] })[Symbol.asyncIterator]().next(),
+    () => client.responses.create({ model: concreteModel, input: "hello" }),
+    () => client.responses.stream({ model: concreteModel, input: "hello" })[Symbol.asyncIterator]().next(),
+    () => client.images.generate({ model: concreteModel, prompt: "hello" }),
+    () => client.messages.create({ model: concreteModel, max_tokens: 16, messages: [] }),
+    () => client.messages.stream({ model: concreteModel, max_tokens: 16, messages: [] })[Symbol.asyncIterator]().next(),
+  ];
+
+  for (const call of calls) {
+    await assert.rejects(call, /model must be "auto"/);
+  }
+  assert.equal(requests, 0);
+});
+
+test("lists localized model descriptions", async () => {
+  let requestedURL = "";
+  const client = new JoyTokenClient({
+    fetch: async (input) => {
+      requestedURL = String(input);
+      return Response.json({
+        code: 0,
+        message: "success",
+        data: {
+          models: [{
+            modelId: "auto",
+            modelKey: "auto",
+            displayName: "auto",
+            alias: "auto",
+            tier: "standard",
+            tags: ["lock"],
+            description: "localized",
+            customerInputMtok: 200,
+            customerOutputMtok: 900,
+            customerCachereadMtok: 20,
+            customerCachewriteMtok: 250,
+            customerImageInputMtok: "",
+            customerImageOutputMtok: "",
+            customerImageCachedInputMtok: "",
+            provider: "auto",
+            featureTags: ["agent"],
+            scenarioTags: [],
+            mciScore: 7.57,
+          }],
+        },
+      });
+    },
+  });
+
+  const models = await client.models.list({ locale: "zh" });
+  assert.equal(new URL(requestedURL).searchParams.get("locale"), "zh");
+  assert.equal(models.data.models[0]?.modelId, "auto");
+  assert.equal(models.data.models[0]?.displayName, "auto");
+  assert.equal(models.data.models[0]?.customerCachereadMtok, 20);
+  await assert.rejects(() => client.models.list({ locale: "zh-CN" as "zh" }), /model locale/);
 });
 
 test("retrieves model catalog metadata and pricing", async () => {
@@ -279,7 +348,7 @@ test("retrieves model catalog metadata and pricing", async () => {
 test("lists models without an API key", async () => {
   const client = new JoyTokenClient({ apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
   const models = await client.models.list();
-  assert.equal(models.data[0]?.id, "joy/mock");
+  assert.equal(models.data.models[0]?.modelId, "auto");
 });
 
 test("rejects authenticated requests locally when the API key is missing", async () => {

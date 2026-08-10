@@ -6,10 +6,12 @@ import type {
   ImageGenerationRequest,
   ImageGenerationResponse,
   JoyTokenClientOptions,
+  ListModelsOptions,
   MessageRequest,
   MessageResponse,
   MessageStreamEvent,
   MessageStreamRequest,
+  ModelInfo,
   ModelListResponse,
   ModelMetadataResponse,
   PricingResponse,
@@ -27,6 +29,10 @@ const STREAM_DONE = Symbol("stream-done");
 interface ActiveRequest {
   response: Response;
   cleanup(): void;
+}
+
+interface RawModelListResponse extends Omit<ModelListResponse, "data"> {
+  data: ModelInfo[] | { models?: ModelInfo[] };
 }
 
 export class JoyTokenAPIError extends Error {
@@ -65,7 +71,7 @@ export class JoyTokenClient {
   };
 
   readonly models = {
-    list: (): Promise<ModelListResponse> => this.listModels(),
+    list: (options: ListModelsOptions = {}): Promise<ModelListResponse> => this.listModels(options),
     meta: (): Promise<ModelMetadataResponse> => this.getModelMetadata(),
   };
 
@@ -110,6 +116,7 @@ export class JoyTokenClient {
   }
 
   private async createChatCompletion(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+    this.requireAutoModel(request.model);
     this.requireAPIKey();
     if (request.stream) {
       throw new Error("Use joytoken.chat.completions.stream() for streaming responses.");
@@ -122,6 +129,7 @@ export class JoyTokenClient {
   }
 
   private async *streamChatCompletion(request: ChatCompletionStreamRequest): AsyncIterable<ChatCompletionChunk> {
+    this.requireAutoModel(request.model);
     this.requireAPIKey();
     const activeRequest = await this.requestRaw(`${this.openAIBaseUrl}/chat/completions`, {
       method: "POST",
@@ -137,6 +145,7 @@ export class JoyTokenClient {
   }
 
   private async createResponse(request: ResponseRequest): Promise<JoyTokenResponse> {
+    this.requireAutoModel(request.model);
     this.requireAPIKey();
     if (request.stream) {
       throw new Error("Use joytoken.responses.stream() for streaming responses.");
@@ -149,6 +158,7 @@ export class JoyTokenClient {
   }
 
   private async *streamResponse(request: ResponseStreamRequest): AsyncIterable<ResponseStreamEvent> {
+    this.requireAutoModel(request.model);
     this.requireAPIKey();
     const activeRequest = await this.requestRaw(`${this.openAIBaseUrl}/responses`, {
       method: "POST",
@@ -164,6 +174,7 @@ export class JoyTokenClient {
   }
 
   private async generateImage(request: ImageGenerationRequest): Promise<ImageGenerationResponse> {
+    this.requireAutoModel(request.model);
     this.requireAPIKey();
     return this.requestJSON<ImageGenerationResponse>(`${this.openAIBaseUrl}/images/generations`, {
       method: "POST",
@@ -172,6 +183,7 @@ export class JoyTokenClient {
   }
 
   private async createMessage(request: MessageRequest): Promise<MessageResponse> {
+    this.requireAutoModel(request.model);
     this.requireAPIKey();
     if (request.stream) {
       throw new Error("Use joytoken.messages.stream() for streaming responses.");
@@ -189,6 +201,7 @@ export class JoyTokenClient {
   }
 
   private async *streamMessage(request: MessageStreamRequest): AsyncIterable<MessageStreamEvent> {
+    this.requireAutoModel(request.model);
     this.requireAPIKey();
     const activeRequest = await this.requestRaw(
       `${this.anthropicBaseUrl}/messages`,
@@ -207,8 +220,25 @@ export class JoyTokenClient {
     }
   }
 
-  private async listModels(): Promise<ModelListResponse> {
-    return this.requestJSON<ModelListResponse>(`${this.apiBaseUrl}/api/v1/models`, { method: "GET" });
+  private async listModels(options: ListModelsOptions): Promise<ModelListResponse> {
+    if (options.locale !== undefined && options.locale !== "zh" && options.locale !== "en") {
+      throw new Error('JoyToken model locale must be "zh" or "en".');
+    }
+
+    const endpoint = new URL(`${this.apiBaseUrl}/api/v1/models`);
+    if (options.locale) {
+      endpoint.searchParams.set("locale", options.locale);
+    }
+    const response = await this.requestJSON<RawModelListResponse>(endpoint.toString(), { method: "GET" });
+    const models = Array.isArray(response.data) ? response.data : response.data?.models;
+    if (!Array.isArray(models)) {
+      throw new Error("JoyToken model list response must contain data.models or an array in data.");
+    }
+
+    return {
+      ...response,
+      data: { models },
+    };
   }
 
   private async getModelMetadata(): Promise<ModelMetadataResponse> {
@@ -224,6 +254,12 @@ export class JoyTokenClient {
   private requireAPIKey(): void {
     if (!this.apiKey?.trim()) {
       throw new Error("JoyToken API key is required. Pass apiKey or set JOY_TOKEN_API_KEY.");
+    }
+  }
+
+  private requireAutoModel(model: unknown): void {
+    if (model !== "auto") {
+      throw new Error('JoyToken model must be "auto".');
     }
   }
 

@@ -1,15 +1,14 @@
 import { JoyTokenClient, } from "@joytoken/client-sdk-ts";
 export function createJoyTokenProvider(options = {}) {
     const client = new JoyTokenClient(options);
-    const defaultModel = options.defaultModel ?? "auto";
     const protocol = options.protocol ?? "openai";
     return {
         async complete(request) {
             if (protocol === "anthropic") {
-                return completeAnthropic(client, request, defaultModel);
+                return completeAnthropic(client, request);
             }
             const payload = {
-                model: request.model || defaultModel,
+                model: "auto",
                 messages: request.messages,
                 temperature: request.temperature,
                 max_tokens: request.maxTokens,
@@ -30,8 +29,8 @@ export function createJoyTokenProvider(options = {}) {
         },
     };
 }
-async function completeAnthropic(client, request, defaultModel) {
-    const converted = toAnthropicRequest(request, request.model || defaultModel);
+async function completeAnthropic(client, request) {
+    const converted = toAnthropicRequest(request);
     const response = await client.messages.create(converted);
     return {
         message: normalizeAnthropicMessage(response),
@@ -39,7 +38,7 @@ async function completeAnthropic(client, request, defaultModel) {
         raw: response,
     };
 }
-function toAnthropicRequest(request, model) {
+function toAnthropicRequest(request) {
     const systemBlocks = [];
     const messages = [];
     for (const message of request.messages) {
@@ -78,7 +77,7 @@ function toAnthropicRequest(request, model) {
         });
     }
     const payload = {
-        model,
+        model: "auto",
         max_tokens: request.maxTokens ?? 1024,
         messages,
         system: systemBlocks.length ? systemBlocks.join("\n\n") : undefined,

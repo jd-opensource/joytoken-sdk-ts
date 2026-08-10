@@ -15,23 +15,21 @@ import type { ModelProvider, ModelRequest, ModelResponse } from "./types.js";
 export type JoyTokenProtocol = "openai" | "anthropic";
 
 export interface JoyTokenProviderOptions extends JoyTokenClientOptions {
-  defaultModel?: string;
   protocol?: JoyTokenProtocol;
 }
 
 export function createJoyTokenProvider(options: JoyTokenProviderOptions = {}): ModelProvider {
   const client = new JoyTokenClient(options);
-  const defaultModel = options.defaultModel ?? "auto";
   const protocol = options.protocol ?? "openai";
 
   return {
     async complete(request: ModelRequest): Promise<ModelResponse> {
       if (protocol === "anthropic") {
-        return completeAnthropic(client, request, defaultModel);
+        return completeAnthropic(client, request);
       }
 
       const payload: ChatCompletionRequest = {
-        model: request.model || defaultModel,
+        model: "auto",
         messages: request.messages,
         temperature: request.temperature,
         max_tokens: request.maxTokens,
@@ -55,8 +53,8 @@ export function createJoyTokenProvider(options: JoyTokenProviderOptions = {}): M
   };
 }
 
-async function completeAnthropic(client: JoyTokenClient, request: ModelRequest, defaultModel: string): Promise<ModelResponse> {
-  const converted = toAnthropicRequest(request, request.model || defaultModel);
+async function completeAnthropic(client: JoyTokenClient, request: ModelRequest): Promise<ModelResponse> {
+  const converted = toAnthropicRequest(request);
   const response = await client.messages.create(converted);
 
   return {
@@ -66,7 +64,7 @@ async function completeAnthropic(client: JoyTokenClient, request: ModelRequest, 
   };
 }
 
-function toAnthropicRequest(request: ModelRequest, model: string): MessageRequest {
+function toAnthropicRequest(request: ModelRequest): MessageRequest {
   const systemBlocks: string[] = [];
   const messages: MessageParam[] = [];
 
@@ -110,7 +108,7 @@ function toAnthropicRequest(request: ModelRequest, model: string): MessageReques
   }
 
   const payload: MessageRequest = {
-    model,
+    model: "auto",
     max_tokens: request.maxTokens ?? 1024,
     messages,
     system: systemBlocks.length ? systemBlocks.join("\n\n") : undefined,

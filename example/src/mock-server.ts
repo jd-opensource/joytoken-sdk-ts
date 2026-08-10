@@ -15,7 +15,10 @@ export async function createMockJoyTokenServer(): Promise<MockJoyTokenServer> {
 
     if (req.method === "GET" && req.url === "/api/v1/models") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ object: "list", data: [{ id: "joy/mock", name: "Joy Mock" }] }));
+      res.end(JSON.stringify({
+        object: "list",
+        data: { models: [{ modelId: "auto", modelKey: "auto", displayName: "auto", alias: "auto" }] },
+      }));
       return;
     }
 
@@ -33,7 +36,7 @@ export async function createMockJoyTokenServer(): Promise<MockJoyTokenServer> {
       const content = hasToolResult ? "tool result accepted" : "pong";
       res.writeHead(200, {
         "Content-Type": "application/json",
-        "X-DAOE-Used-Model": "joy/mock",
+        "X-DAOE-Used-Model": "auto",
         "X-DAOE-Used-Provider": "mock-provider",
       });
       res.end(

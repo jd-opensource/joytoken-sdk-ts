@@ -26,7 +26,6 @@ export class Agent {
                 };
             }
             const response = await this.options.model.complete({
-                model: this.options.modelName ?? "auto",
                 messages,
                 tools: [...this.toolsByName.values()].map(toChatTool),
                 temperature: this.options.temperature,

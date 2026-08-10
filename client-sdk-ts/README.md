@@ -81,6 +81,10 @@ The client supports:
 
 The default endpoint is `https://api.joytokens.ai`; requests time out after 60 seconds by default. Pass `timeoutMs: 0` to disable the SDK timeout, or pass `apiBaseUrl`, `openAIBaseUrl`, and `anthropicBaseUrl` to target another environment. Authenticated model calls, model metadata and pricing requests fail locally when the API key is missing; `models.list()` remains unauthenticated. HTTP failures throw `JoyTokenAPIError` with the status, request ID, response headers, and parsed response body.
 
+All model requests require `model: "auto"`; concrete model IDs are rejected before a network request is sent.
+
+Use `models.list({ locale: "zh" })` or `models.list({ locale: "en" })` to select the language of each model description. `locale` is a per-call catalog option, not global client configuration. When it is omitted, the API defaults to English. Catalog entries are returned in `response.data.models`, matching the HTTP response envelope.
+
 Streaming methods return an `AsyncIterable`. Breaking out of the loop cancels the underlying response body.
 
 ```ts

@@ -94,6 +94,10 @@ SDK 目前仅覆盖已经公开的 JoyToken 开发者 API：
 
 调用需要鉴权的模型接口、模型元数据和价格接口时，如果未配置 API Key，SDK 会在发送网络请求前直接给出明确错误。只有 `models.list()` 是无需鉴权的模型目录接口。
 
+所有模型请求都必须使用 `model: "auto"`；传入具体模型 ID 时，SDK 会在本地直接拒绝。
+
+模型描述语言按 `models.list()` 调用设置，不是客户端全局配置。传入 `{ locale: "zh" }` 或 `{ locale: "en" }`；不传时接口默认返回英文描述。SDK 保留接口原始响应层级，模型目录项位于 `response.data.models`。
+
 ## 仓库开发
 
 以下命令用于从源码 checkout 后参与仓库开发。仓库已经包含根目录 `package.json`、workspace 配置和锁文件：
@@ -120,7 +124,6 @@ git diff --exit-code -- client-sdk-ts/dist agent-sdk-ts/dist
 ```bash
 cd example
 export JOY_TOKEN_API_KEY="..."
-export JOY_TOKEN_MODEL="auto"
 pnpm live
 ```
 

@@ -22,10 +22,10 @@ test("uses client-sdk-ts against a JoyToken-compatible endpoint", async () => {
   });
 
   const models = await client.models.list();
-  assert.equal(models.data[0]?.id, "joy/mock");
+  assert.equal(models.data.models[0]?.modelId, "auto");
 
   const completion = await client.chat.completions.create({
-    model: "joy/mock",
+    model: "auto",
     messages: [{ role: "user", content: "ping" }],
   });
   assert.equal(completion.choices[0]?.message.content, "pong");
@@ -37,7 +37,6 @@ test("uses agent-sdk-ts with JoyToken provider", async () => {
       apiKey: "example-key",
       apiBaseUrl: server.baseUrl,
       openAIBaseUrl: `${server.baseUrl}/openai/v1`,
-      defaultModel: "joy/mock",
     }),
   });
 

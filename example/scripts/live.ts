@@ -4,7 +4,6 @@ import { JoyTokenClient } from "@joytoken/client-sdk-ts";
 const apiKey = process.env.JOY_TOKEN_API_KEY;
 const apiBaseUrl = process.env.JOY_TOKEN_API_BASE_URL ?? "https://api.joytokens.ai";
 const openAIBaseUrl = process.env.JOY_TOKEN_OPENAI_BASE_URL ?? `${apiBaseUrl.replace(/\/+$/, "")}/openai/v1`;
-const model = process.env.JOY_TOKEN_MODEL ?? "auto";
 
 if (!apiKey) {
   throw new Error("Set JOY_TOKEN_API_KEY before running the live JoyToken example.");
@@ -20,16 +19,16 @@ const client = new JoyTokenClient({
 console.log(`JoyToken live example`);
 console.log(`API base URL: ${apiBaseUrl}`);
 console.log(`OpenAI base URL: ${openAIBaseUrl}`);
-console.log(`Model: ${model}`);
+console.log("Model: auto");
 
 const models = await client.models.list();
-console.log(`Models returned: ${models.data.length}`);
-if (models.data[0]) {
-  console.log(`First model: ${models.data[0].id}`);
+console.log(`Models returned: ${models.data.models.length}`);
+if (models.data.models[0]) {
+  console.log(`First model: ${models.data.models[0].alias}`);
 }
 
 const completion = await client.chat.completions.create({
-  model,
+  model: "auto",
   messages: [{ role: "user", content: "Reply with one short sentence confirming JoyToken is connected." }],
   max_tokens: 80,
 });
@@ -38,12 +37,10 @@ console.log("\nClient SDK response:");
 console.log(completion.choices[0]?.message.content ?? "");
 
 const agent = new Agent({
-  modelName: model,
   model: createJoyTokenProvider({
     apiKey,
     apiBaseUrl,
     openAIBaseUrl,
-    defaultModel: model,
     timeoutMs: 60_000,
   }),
   system: "You are testing the JoyToken Agent SDK. Keep the answer short.",
