@@ -1,0 +1,33 @@
+{
+  "name": "@joytoken/client-sdk-ts",
+  "version": "0.2.0",
+  "description": "TypeScript SDK for JoyToken's OpenAI- and Anthropic-compatible APIs",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jd-opensource/joytoken-sdk-ts.git",
+    "directory": "client-sdk-ts"
+  },
+  "homepage": "https://github.com/jd-opensource/joytoken-sdk-ts#readme",
+  "bugs": {
+    "url": "https://github.com/jd-opensource/joytoken-sdk-ts/issues"
+  },
+  "keywords": ["joytoken", "openai", "anthropic", "llm", "sdk"],
+  "engines": { "node": ">=18" },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE", "NOTICE"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

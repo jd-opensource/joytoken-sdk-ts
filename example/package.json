@@ -1,0 +1,15 @@
+{
+  "name": "joytoken-sdk-ts-example",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "live": "node --import tsx scripts/live.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@joytoken/agent-sdk-ts": "workspace:*",
+    "@joytoken/client-sdk-ts": "workspace:*"
+  }
+}
