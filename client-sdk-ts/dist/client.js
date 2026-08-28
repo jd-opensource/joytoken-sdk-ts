@@ -5,10 +5,15 @@ import { gateFileWrite } from "./file-permission.js";
 import { shell, absWorkingDir } from "./shell-tools.js";
 import { gateShell } from "./shell-permission.js";
 import { FinishReasonKind, classifyFinishReason, malformedToolCallNudge } from "./finish-reason.js";
+import { mergeOpaqueObject } from "./opaque.js";
 const DEFAULT_API_BASE_URL = "https://api.joytokens.ai";
 const SDK_VERSION = "0.2.0";
 const DEFAULT_TIMEOUT_MS = 60_000;
-const DEFAULT_MAX_RETRIES = 2;
+// Model generation requests are not inherently idempotent: a provider may
+// have completed and billed a request even when the client receives a
+// transport or Gateway error. Keep retries opt-in so the SDK does not duplicate
+// model calls or amplify an upstream circuit breaker by default.
+const DEFAULT_MAX_RETRIES = 0;
 const RETRY_BASE_DELAY_MS = 500;
 const RETRY_MAX_DELAY_MS = 8_000;
 const DEFAULT_TOOL_MAX_STEPS = 8;
@@ -35,6 +40,7 @@ export class JoyTokenAPIError extends Error {
     requestId;
     responseHeaders;
     body;
+    context;
     constructor(message, options) {
         super(message);
         this.name = "JoyTokenAPIError";
@@ -43,6 +49,7 @@ export class JoyTokenAPIError extends Error {
         this.responseHeaders = options.responseHeaders;
         this.body = options.body;
         this.requestId = options.requestId;
+        this.context = options.context;
     }
 }
 export class JoyTokenClient {
@@ -139,16 +146,16 @@ export class JoyTokenClient {
     }
     async createChatCompletion(request) {
         const plan = this.chatToolPlan(request.tools);
-        return this.completeChat(request, plan, plan.automatic);
+        return this.completeChat(request, plan, plan.automatic, "chat");
     }
     async runChatCompletionExplicit(request) {
-        return this.completeChat(request, this.chatToolPlan(request.tools), true);
+        return this.completeChat(request, this.chatToolPlan(request.tools), true, "chat");
     }
-    async completeChat(request, plan, executeTools) {
-        const first = await this.createChatCompletionOnce(request, plan.declarations);
+    async completeChat(request, plan, executeTools, protocol) {
+        const first = await withAPIErrorContext(requestErrorContext(protocol, "initial_request", 1), () => this.createChatCompletionOnce(request, plan.declarations));
         if (!executeTools)
             return first;
-        return this.runChatCompletion(request, plan, first);
+        return this.runChatCompletion(request, plan, first, protocol);
     }
     /**
      * createChatCompletionOnce injects tool declarations and performs a single
@@ -179,7 +186,7 @@ export class JoyTokenClient {
      * turn. It stops on a plain stop finish, when no executable tool calls remain,
      * or when the step budget is exhausted.
      */
-    async runChatCompletion(request, plan, first) {
+    async runChatCompletion(request, plan, first, protocol) {
         const messages = [...request.messages];
         let response = first;
         for (let step = 0; step < this.toolMaxSteps; step += 1) {
@@ -193,7 +200,7 @@ export class JoyTokenClient {
             const toolCalls = message.tool_calls ?? [];
             if (kind === FinishReasonKind.MalformedToolCall && toolCalls.length === 0) {
                 messages.push({ role: "user", content: malformedToolCallNudge });
-                response = await this.createChatCompletionOnce({ ...request, messages }, plan.declarations);
+                response = await withAPIErrorContext(requestErrorContext(protocol, "repair_continuation", step + 2), () => this.createChatCompletionOnce({ ...request, messages }, plan.declarations));
                 continue;
             }
             if (toolCalls.length === 0) {
@@ -208,23 +215,32 @@ export class JoyTokenClient {
                     content: result.content,
                 });
             }
-            response = await this.createChatCompletionOnce({ ...request, messages }, plan.declarations);
+            response = await withAPIErrorContext(requestErrorContext(protocol, "tool_continuation", step + 2, step + 1, toolCalls), () => this.createChatCompletionOnce({ ...request, messages }, plan.declarations));
         }
         return response;
     }
     async *streamChatCompletion(request) {
         const plan = this.chatToolPlan(request.tools);
-        yield* this.streamChatCompletionWire(request, plan.declarations);
+        try {
+            yield* this.streamChatCompletionWire(request, plan.declarations);
+        }
+        catch (error) {
+            throw attachAPIErrorContext(error, requestErrorContext("chat", "initial_request", 1));
+        }
     }
     async runChatCompletionStreamExplicit(request, options) {
         const plan = this.chatToolPlan(request.tools);
-        return this.runChatCompletionStream(request, plan, options);
+        return this.runChatCompletionStream(request, plan, options, "chat");
     }
-    async runChatCompletionStream(request, plan, options) {
+    async runChatCompletionStream(request, plan, options, protocol) {
         const messages = [...request.messages];
         let response;
+        let continuationCalls = [];
         for (let step = 0; step < this.toolMaxSteps; step += 1) {
-            response = await this.collectChatStreamTurn({ ...request, messages, stream: true }, plan.declarations, options.onTextDelta);
+            const context = step === 0
+                ? requestErrorContext(protocol, "initial_request", 1)
+                : requestErrorContext(protocol, "tool_continuation", step + 1, step, continuationCalls);
+            response = await withAPIErrorContext(context, () => this.collectChatStreamTurn({ ...request, messages, stream: true }, plan.declarations, options.onTextDelta));
             const message = response.choices[0]?.message;
             if (!message)
                 return response;
@@ -232,6 +248,7 @@ export class JoyTokenClient {
             const toolCalls = message.tool_calls ?? [];
             if (toolCalls.length === 0)
                 return response;
+            continuationCalls = toolCalls;
             for (const toolCall of toolCalls) {
                 const result = await this.runTool(plan.executables, step, toolCall, messages);
                 options.onToolResult?.(result);
@@ -274,13 +291,16 @@ export class JoyTokenClient {
                 for (const raw of delta.tool_calls ?? []) {
                     const index = typeof raw.index === "number" ? raw.index : 0;
                     const fn = (raw.function ?? {});
-                    const call = calls.get(index) ?? { id: "", name: "", arguments: "" };
+                    const call = calls.get(index) ?? { id: "", type: "function", name: "", arguments: "" };
                     if (typeof raw.id === "string" && raw.id)
                         call.id = raw.id;
+                    if (raw.type === "function")
+                        call.type = raw.type;
                     if (typeof fn.name === "string")
                         call.name += fn.name;
                     if (typeof fn.arguments === "string")
                         call.arguments += fn.arguments;
+                    call.extra_content = mergeOpaqueObject(call.extra_content, raw.extra_content);
                     calls.set(index, call);
                 }
             }
@@ -297,7 +317,14 @@ export class JoyTokenClient {
                         role: "assistant",
                         content: content || null,
                         ...(calls.size
-                            ? { tool_calls: [...calls.values()].map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } })) }
+                            ? {
+                                tool_calls: [...calls.values()].map((call) => ({
+                                    id: call.id,
+                                    type: call.type,
+                                    function: { name: call.name, arguments: call.arguments },
+                                    ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
+                                })),
+                            }
                             : {}),
                     },
                     finish_reason: finishReason,
@@ -330,8 +357,9 @@ export class JoyTokenClient {
     }
     async createResponse(request) {
         const plan = this.responseToolPlan(request.tools);
-        if (!plan.automatic)
-            return this.createResponseOnce(request, plan.declarations);
+        if (!plan.automatic) {
+            return withAPIErrorContext(requestErrorContext("responses", "initial_request", 1), () => this.createResponseOnce(request, plan.declarations));
+        }
         return this.completeResponse(request, plan);
     }
     async runResponseExplicit(request) {
@@ -360,17 +388,17 @@ export class JoyTokenClient {
         let input = normalizeResponseInput(request.input);
         const chained = request.previous_response_id !== undefined;
         let previousResponseId = request.previous_response_id;
-        const requestTurn = async () => {
+        const requestTurn = async (context) => {
             const stepRequest = {
                 ...request,
                 input,
                 ...(previousResponseId === undefined ? {} : { previous_response_id: previousResponseId }),
             };
-            return streamOptions
-                ? await this.collectResponseStreamTurn({ ...stepRequest, stream: true }, plan.declarations, streamOptions.onTextDelta)
-                : await this.createResponseOnce(stepRequest, plan.declarations);
+            return withAPIErrorContext(context, () => streamOptions
+                ? this.collectResponseStreamTurn({ ...stepRequest, stream: true }, plan.declarations, streamOptions.onTextDelta)
+                : this.createResponseOnce(stepRequest, plan.declarations));
         };
-        let response = await requestTurn();
+        let response = await requestTurn(requestErrorContext("responses", "initial_request", 1));
         for (let step = 0; step < this.toolMaxSteps; step += 1) {
             const calls = responseFunctionCalls(response);
             if (calls.length === 0)
@@ -378,11 +406,7 @@ export class JoyTokenClient {
             const replay = chained ? [] : [...input, ...(response.output ?? []).map(responseOutputToInput)];
             const outputs = [];
             for (const call of calls) {
-                const toolCall = {
-                    id: call.call_id ?? call.id ?? "",
-                    type: "function",
-                    function: { name: call.name ?? "", arguments: call.arguments ?? "" },
-                };
+                const toolCall = responseFunctionCallToToolCall(call);
                 const result = await this.runTool(plan.executables, step, toolCall, responseInputToContextMessages(chained ? [...input, responseOutputToInput(call)] : replay, request.instructions));
                 streamOptions?.onToolResult?.(result);
                 outputs.push({
@@ -394,13 +418,19 @@ export class JoyTokenClient {
             input = [...replay, ...outputs];
             if (chained)
                 previousResponseId = response.id;
-            response = await requestTurn();
+            const toolCalls = calls.map(responseFunctionCallToToolCall);
+            response = await requestTurn(requestErrorContext("responses", "tool_continuation", step + 2, step + 1, toolCalls));
         }
         return response;
     }
     async *streamResponse(request) {
         const plan = this.responseToolPlan(request.tools);
-        yield* this.streamResponseWire(request, plan.declarations);
+        try {
+            yield* this.streamResponseWire(request, plan.declarations);
+        }
+        catch (error) {
+            throw attachAPIErrorContext(error, requestErrorContext("responses", "initial_request", 1));
+        }
     }
     async *streamResponseWire(request, declarations) {
         this.requireAutoModel(request.model);
@@ -443,31 +473,51 @@ export class JoyTokenClient {
         if (!terminalResponse) {
             throw new Error("JoyToken Responses stream ended without a terminal response event.");
         }
-        const collectedOutput = output.filter((item) => item !== undefined);
-        const response = terminalResponse.output === undefined && collectedOutput.length > 0
+        const terminalOutput = terminalResponse.output ?? [];
+        const outputLength = Math.max(output.length, terminalOutput.length);
+        const collectedOutput = Array.from({ length: outputLength }, (_, index) => {
+            const streamed = output[index];
+            const terminal = terminalOutput[index];
+            if (!streamed)
+                return terminal;
+            if (!terminal)
+                return streamed;
+            const extraContent = mergeOpaqueObject(streamed.extra_content, terminal.extra_content);
+            return {
+                ...streamed,
+                ...terminal,
+                ...(extraContent === undefined ? {} : { extra_content: extraContent }),
+            };
+        }).filter((item) => item !== undefined);
+        const response = collectedOutput.length > 0
             ? { ...terminalResponse, output: collectedOutput }
             : terminalResponse;
         return withResponseOutputText(response);
     }
     async createMessage(request) {
         const plan = this.messageToolPlan(request.tools);
-        const response = await this.completeChat(messageRequestToChat(request, plan.declarations), plan, plan.automatic);
+        const response = await this.completeChat(messageRequestToChat(request, plan.declarations), plan, plan.automatic, "messages");
         return chatResponseToMessage(response);
     }
     async runMessageExplicit(request) {
         const plan = this.messageToolPlan(request.tools);
-        const response = await this.completeChat(messageRequestToChat(request, plan.declarations), plan, true);
+        const response = await this.completeChat(messageRequestToChat(request, plan.declarations), plan, true, "messages");
         return chatResponseToMessage(response);
     }
     async *streamMessage(request) {
         const plan = this.messageToolPlan(request.tools);
         const chatRequest = messageRequestToChat(request, plan.declarations);
-        yield* chatStreamToMessages(this.streamChatCompletionWire({ ...chatRequest, stream: true }, plan.declarations));
+        try {
+            yield* chatStreamToMessages(this.streamChatCompletionWire({ ...chatRequest, stream: true }, plan.declarations));
+        }
+        catch (error) {
+            throw attachAPIErrorContext(error, requestErrorContext("messages", "initial_request", 1));
+        }
     }
     async runMessageStreamExplicit(request, options) {
         const plan = this.messageToolPlan(request.tools);
         const chatRequest = messageRequestToChat(request, plan.declarations);
-        const response = await this.runChatCompletionStream(chatRequest, plan, options);
+        const response = await this.runChatCompletionStream(chatRequest, plan, options, "messages");
         return chatResponseToMessage(response);
     }
     async generateImage(request) {
@@ -743,6 +793,44 @@ function emptyChatResponse() {
         choices: [{ index: 0, message: { role: "assistant", content: null }, finish_reason: "length" }],
     };
 }
+function requestErrorContext(protocol, phase, requestNumber, toolStep, toolCalls) {
+    return {
+        protocol,
+        phase,
+        requestNumber,
+        ...(toolStep === undefined ? {} : { toolStep }),
+        ...(toolCalls === undefined
+            ? {}
+            : {
+                toolCalls: toolCalls.map((call) => ({
+                    id: call.id,
+                    name: call.function?.name ?? "",
+                    hasExtraContent: call.extra_content !== undefined,
+                })),
+            }),
+    };
+}
+async function withAPIErrorContext(context, operation) {
+    try {
+        return await operation();
+    }
+    catch (error) {
+        throw attachAPIErrorContext(error, context);
+    }
+}
+function attachAPIErrorContext(error, context) {
+    if (error instanceof JoyTokenAPIError && error.context === undefined) {
+        // Preserve the original error instance, stack, status, body, headers and
+        // request ID. Only the diagnostic field is added; no request is retried.
+        Object.defineProperty(error, "context", {
+            value: context,
+            enumerable: true,
+            configurable: true,
+            writable: false,
+        });
+    }
+    return error;
+}
 function normalizeResponseInput(input) {
     if (typeof input === "string") {
         return input === "" ? [] : [{ type: "message", role: "user", content: input }];
@@ -754,6 +842,14 @@ function responseOutputToInput(item) {
 }
 function responseFunctionCalls(response) {
     return (response.output ?? []).filter((item) => item.type === "function_call");
+}
+function responseFunctionCallToToolCall(call) {
+    return {
+        id: call.call_id ?? call.id ?? "",
+        type: "function",
+        function: { name: call.name ?? "", arguments: call.arguments ?? "" },
+        ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
+    };
 }
 function responseOutputText(response) {
     let text = "";
@@ -787,6 +883,7 @@ function responseInputToContextMessages(input, instructions) {
                 id: item.call_id ?? item.id ?? "",
                 type: "function",
                 function: { name: item.name ?? "", arguments: item.arguments ?? "" },
+                ...(item.extra_content === undefined ? {} : { extra_content: item.extra_content }),
             };
             const previous = messages.at(-1);
             if (previous?.role === "assistant" && previous.tool_calls)
@@ -915,9 +1012,7 @@ async function buildAPIError(response) {
     catch {
         body = text;
     }
-    const message = typeof body === "object" && body && "error" in body
-        ? JSON.stringify(body.error)
-        : `JoyToken API request failed with status ${response.status}`;
+    const message = extractAPIErrorMessage(body) ?? `JoyToken API request failed with status ${response.status}`;
     return new JoyTokenAPIError(message, {
         status: response.status,
         code: classifyStatus(response.status),
@@ -925,6 +1020,20 @@ async function buildAPIError(response) {
         body,
         requestId: extractRequestId(response.headers),
     });
+}
+function extractAPIErrorMessage(body) {
+    if (typeof body === "string")
+        return body || undefined;
+    if (!isRecord(body))
+        return undefined;
+    const error = body.error;
+    if (typeof error === "string")
+        return error || undefined;
+    if (isRecord(error) && typeof error.message === "string" && error.message)
+        return error.message;
+    if (typeof body.message === "string" && body.message)
+        return body.message;
+    return error === undefined ? undefined : JSON.stringify(error);
 }
 function extractRequestId(headers) {
     return headers.get("x-request-id") ?? headers.get("x-daoe-request-id") ?? undefined;

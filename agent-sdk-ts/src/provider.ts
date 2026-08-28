@@ -87,6 +87,7 @@ function toAnthropicRequest(request: ModelRequest): MessageRequest {
           id: call.id,
           name: call.function.name,
           input: parseObject(call.function.arguments),
+          ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
         })),
       );
       appendAnthropicMessage(messages, { role: "assistant", content });
@@ -138,6 +139,7 @@ function normalizeAnthropicMessage(response: MessageResponse): ChatMessage {
       id: block.id!,
       type: "function" as const,
       function: { name: block.name!, arguments: JSON.stringify(block.input ?? {}) },
+      ...(block.extra_content === undefined ? {} : { extra_content: block.extra_content }),
     }));
   return { role: "assistant", content: text || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
 }

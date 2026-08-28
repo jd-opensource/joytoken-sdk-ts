@@ -13,6 +13,7 @@ import type {
   ToolCall,
   Usage,
 } from "./types.js";
+import { mergeOpaqueObject } from "./opaque.js";
 
 export type ChatWireTool = ChatTool | Record<string, unknown>;
 
@@ -75,6 +76,7 @@ export function chatResponseToMessage(response: ChatCompletionResponse): Message
       id: call.id,
       name: call.function.name,
       input: parseObject(call.function.arguments),
+      ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
     });
   }
   const metadata = anthropicMetadata(response.metadata, response.usage);
@@ -104,7 +106,13 @@ export async function* chatStreamToMessages(
   let textBlock: number | undefined;
   let textBlockOpen = false;
   let deferredText = "";
-  const callBlocks = new Map<number, { block: number; id: string; name: string; arguments: string }>();
+  const callBlocks = new Map<number, {
+    block: number;
+    id: string;
+    name: string;
+    arguments: string;
+    extra_content?: Record<string, unknown>;
+  }>();
 
   for await (const chunk of chunks) {
     id = chunk.id ?? id;
@@ -172,6 +180,7 @@ export async function* chatStreamToMessages(
         if (typeof raw.id === "string" && raw.id) call.id = raw.id;
         const partial = typeof fn.arguments === "string" ? fn.arguments : "";
         if (partial) call.arguments += partial;
+        call.extra_content = mergeOpaqueObject(call.extra_content, raw.extra_content);
       }
     }
   }
@@ -181,7 +190,13 @@ export async function* chatStreamToMessages(
     yield {
       type: "content_block_start",
       index: call.block,
-      content_block: { type: "tool_use", id: call.id, name: call.name, input: {} },
+      content_block: {
+        type: "tool_use",
+        id: call.id,
+        name: call.name,
+        input: {},
+        ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
+      },
     };
     if (call.arguments) {
       yield {
@@ -226,6 +241,7 @@ function appendAnthropicInput(
           id: block.id ?? "",
           type: "function",
           function: { name: block.name ?? "", arguments: JSON.stringify(block.input ?? {}) },
+          ...(block.extra_content === undefined ? {} : { extra_content: block.extra_content }),
         }),
       );
     messages.push({ role: "assistant", content: text || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });

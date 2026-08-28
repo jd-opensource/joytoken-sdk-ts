@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Disabled automatic model-request retries by default; callers can opt in with `maxRetries` when their workflow has an appropriate idempotency strategy.
+- Added non-invasive `JoyTokenAPIError.context` diagnostics for initial, repair, and tool-continuation model failures without changing requests or tool execution.
 - Normalized Chat streaming metadata-only and usage-only events so every emitted chunk has a stable `choices` array while preserving all Gateway fields.
 - Hardened the Anthropic Messages adapter for missing Gateway usage: required token fields now use explicit compatibility zeroes and carry a `metadata.joytoken.usage_status = "unavailable"` marker.
 - Injected read-only file tools (`file_search`, `list_dir`, `file_read`) into the default local tool set, scoped to `fileWorkspace` (an empty workspace falls back to the current working directory). Behavior change: requests now advertise these tools by default; pass `defaultLocalTools: false` to opt out.

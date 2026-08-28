@@ -126,6 +126,51 @@ test("creates chat completions", async () => {
   assert.equal(response.choices[0]?.message.content, "hello");
 });
 
+test("does not retry transient model failures by default", async () => {
+  let requests = 0;
+  const client = new JoyTokenClient({
+    apiKey: "test-key",
+    fetch: async () => {
+      requests += 1;
+      return Response.json(
+        { error: { message: "provider invoke failed", type: "upstream_error" } },
+        { status: 503 },
+      );
+    },
+  });
+
+  await assert.rejects(
+    () => client.chat.completions.create({ model: "auto", messages: [] }),
+    (error: unknown) => error instanceof JoyTokenAPIError && error.status === 503,
+  );
+  assert.equal(requests, 1);
+});
+
+test("retries transient model failures only when explicitly enabled", async () => {
+  let requests = 0;
+  const client = new JoyTokenClient({
+    apiKey: "test-key",
+    maxRetries: 1,
+    fetch: async () => {
+      requests += 1;
+      if (requests === 1) {
+        return Response.json(
+          { error: { message: "provider invoke failed", type: "upstream_error" } },
+          { status: 503 },
+        );
+      }
+      return Response.json({
+        id: "chatcmpl_retry",
+        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      });
+    },
+  });
+
+  const response = await client.chat.completions.create({ model: "auto", messages: [] });
+  assert.equal(response.choices[0]?.message.content, "ok");
+  assert.equal(requests, 2);
+});
+
 test("streams chat completions", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
   const chunks = [];

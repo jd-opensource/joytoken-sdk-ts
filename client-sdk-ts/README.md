@@ -77,9 +77,11 @@ The Gateway exposes native Chat Completions and Responses endpoints. Only Anthro
 - `GET /api/v1/models/meta`
 - `GET /api/v1/pricing`
 
-The default endpoint is `https://api.joytokens.ai`; requests time out after 60 seconds by default. Pass `timeoutMs: 0` to disable the SDK timeout, or pass `apiBaseUrl`/`openAIBaseUrl` to target another environment. `anthropicBaseUrl` remains accepted for source compatibility but never routes to a separate Messages endpoint. Authenticated model calls, model metadata and pricing requests fail locally when the API key is missing; `models.list()` remains unauthenticated. HTTP failures throw `JoyTokenAPIError` with the status, request ID, response headers, and parsed response body.
+The default endpoint is `https://api.joytokens.ai`; requests time out after 60 seconds by default. Automatic retries are disabled by default because model requests are not inherently idempotent; set `maxRetries` to a positive value only when the caller accepts that risk and has an appropriate idempotency strategy. Pass `timeoutMs: 0` to disable the SDK timeout, or pass `apiBaseUrl`/`openAIBaseUrl` to target another environment. `anthropicBaseUrl` remains accepted for source compatibility but never routes to a separate Messages endpoint. Authenticated model calls, model metadata and pricing requests fail locally when the API key is missing; `models.list()` remains unauthenticated. HTTP failures throw `JoyTokenAPIError` with the status, request ID, response headers, and parsed response body.
 
 Tool ownership is exclusive. An explicit `request.tools` value, including `[]`, is sent without SDK defaults. Otherwise Client-registered tools are used alone. Only when neither exists are local SDK defaults injected and allowed to auto-run. Every tool-loop turn carries the same resolved tools and request options exactly once. `create` and raw `stream` never execute user tools; call `run`/`executeTools` or the streaming `runStream`/`executeToolsStream` entry points to execute Client-registered handlers. Responses tools stay in the native flat shape, and `function_call_output` items are appended to native Responses input. Responses hosted defaults are disabled unless `defaultBuiltinTools: true` is set; hosted `file_search` must be supplied by the caller with its `vector_store_ids`.
+
+`ToolCall.extra_content` is opaque provider extension data. SDK-managed `run`/`executeTools` loops preserve it across Chat Completions, Responses, and Anthropic Messages continuations, including streamed tool calls whose extension objects arrive in multiple chunks. For example, Gemini may return `extra_content.google.thought_signature`; the SDK neither interprets nor manufactures that value. Custom loops must replay the complete returned `ToolCall` (or the complete Responses `function_call` / Messages `tool_use` item) instead of rebuilding only `id` and `function`, otherwise provider-required continuation metadata can be lost. When the provider does not return `extra_content`, the SDK does not add an empty object.
 
 All model requests require `model: "auto"`; concrete model IDs are rejected before a network request is sent.
 
@@ -108,6 +110,11 @@ the compatibility adapter returns zeroes and sets
 `metadata.joytoken.usage_status` to `"unavailable"`; those zeroes are compatibility
 values, not measured usage. HTTP and provider errors, including upstream 503s,
 are always surfaced as `JoyTokenAPIError` and are never converted into success.
+For model HTTP failures, `error.context` identifies the public protocol, whether
+the failure happened on the initial request or a tool continuation, the
+one-based request/tool step, and the involved tool IDs/names. It records only
+diagnostic metadata (never tool arguments or results), preserves the original
+status/body/headers/request ID, and does not retry or execute a tool again.
 
 ```ts
 for await (const event of joytoken.responses.stream({
@@ -124,10 +131,16 @@ for await (const event of joytoken.responses.stream({
 import { JoyTokenAPIError } from "@joytoken/client-sdk-ts";
 
 try {
-  await joytoken.models.list();
+  await joytoken.chat.completions.run({
+    model: "auto",
+    messages: [{ role: "user", content: "Use the registered tool" }],
+  });
 } catch (error) {
   if (error instanceof JoyTokenAPIError) {
-    console.error(error.status, error.requestId, error.body);
+    console.error(error.status, error.requestId, error.message, error.body, error.context);
+    // context.phase is "initial_request", "tool_continuation", or
+    // "repair_continuation". A tool continuation also reports whether each
+    // returned ToolCall included opaque extra_content.
   }
 }
 ```

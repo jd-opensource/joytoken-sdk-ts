@@ -1,5 +1,10 @@
 export { JoyTokenAPIError, JoyTokenClient } from "./client.js";
-export type { ErrorCode } from "./client.js";
+export type {
+  ErrorCode,
+  JoyTokenErrorContext,
+  JoyTokenProtocol,
+  JoyTokenToolCallDiagnostic,
+} from "./client.js";
 export type {
   ChatCompletionChunk,
   ChatCompletionRequest,

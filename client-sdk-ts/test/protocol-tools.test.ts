@@ -24,11 +24,17 @@ function chatResponse(options: {
   content?: string | null;
   toolName?: string;
   arguments?: string;
+  extraContent?: Record<string, unknown>;
   finishReason?: string;
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 } = {}): ChatCompletionResponse {
   const toolCalls = options.toolName
-    ? [{ id: "call_1", type: "function" as const, function: { name: options.toolName, arguments: options.arguments ?? "{}" } }]
+    ? [{
+        id: "call_1",
+        type: "function" as const,
+        function: { name: options.toolName, arguments: options.arguments ?? "{}" },
+        ...(options.extraContent === undefined ? {} : { extra_content: options.extraContent }),
+      }]
     : undefined;
   return {
     id: options.id ?? "chat_1",
@@ -113,6 +119,11 @@ const customChatTool: ChatTool = {
   function: { name: "custom", description: "custom declaration", parameters: { type: "object" } },
 };
 
+const opaqueExtraContent = {
+  google: { thought_signature: "opaque-signature", provider_flag: "keep-me" },
+  future_vendor: { nested: { token: "vendor-token" }, values: [1, 2, 3] },
+};
+
 test("Chat selects exactly one tools owner for undefined, empty, request, and Client tools", async () => {
   const cases = [
     { name: "defaults", request: {}, expected: ["calculator", "datetime", "file_search", "list_dir", "file_read", "file_write", "shell"] },
@@ -195,6 +206,105 @@ test("Chat run executes registered handlers once, reuses the first response, and
   assert.deepEqual(result.usage, { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 });
 });
 
+test("Chat run replays opaque ToolCall extra_content exactly once without changing tools", async () => {
+  let executions = 0;
+  let executionExtraContent: unknown;
+  const echo = defineTool({
+    name: "echo",
+    execute: (_input, context) => {
+      executions += 1;
+      executionExtraContent = context.toolCall.extra_content;
+      return "echoed";
+    },
+  });
+  const { client, requests } = mockClient([
+    chatResponse({ toolName: "echo", arguments: '{"text":"hello"}', extraContent: opaqueExtraContent }),
+    chatResponse({ id: "chat-final", content: "done" }),
+  ], { tools: [echo] });
+
+  await client.chat.completions.run({ model: "auto", messages: [{ role: "user", content: "echo" }] });
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
+  assert.deepEqual(executionExtraContent, opaqueExtraContent);
+  assert.equal(requests[0]?.body.tools.length, 1);
+  assert.equal(requests[1]?.body.tools.length, 1);
+  assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
+  assert.deepEqual(requests[1]?.body.messages.at(-2)?.tool_calls[0]?.extra_content, opaqueExtraContent);
+});
+
+test("Chat run annotates continuation HTTP errors without retrying or re-executing tools", async () => {
+  let executions = 0;
+  const echo = defineTool({
+    name: "echo",
+    execute: () => {
+      executions += 1;
+      return "echoed";
+    },
+  });
+  const failureBody = {
+    error: { code: "INVALID_ARGUMENT", message: "Function call is missing provider metadata" },
+  };
+  const failure = new Response(JSON.stringify(failureBody), {
+    status: 400,
+    headers: { "Content-Type": "application/json", "x-request-id": "req_chat_continuation" },
+  });
+  const { client, requests } = mockClient([
+    chatResponse({ toolName: "echo", extraContent: opaqueExtraContent }),
+    failure,
+  ], { tools: [echo] });
+
+  await assert.rejects(
+    () => client.chat.completions.run({ model: "auto", messages: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.equal(error.status, 400);
+      assert.equal(error.code, "invalid_request");
+      assert.equal(error.requestId, "req_chat_continuation");
+      assert.equal(error.message, "Function call is missing provider metadata");
+      assert.deepEqual(error.body, failureBody);
+      assert.deepEqual(error.context, {
+        protocol: "chat",
+        phase: "tool_continuation",
+        requestNumber: 2,
+        toolStep: 1,
+        toolCalls: [{ id: "call_1", name: "echo", hasExtraContent: true }],
+      });
+      return true;
+    },
+  );
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
+  assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
+});
+
+test("Chat initial HTTP errors are identified before any tool executes", async () => {
+  let executions = 0;
+  const echo = defineTool({ name: "echo", execute: () => { executions += 1; return "echoed"; } });
+  const failure = new Response(JSON.stringify({ error: { message: "provider unavailable" } }), {
+    status: 503,
+    headers: { "Content-Type": "application/json" },
+  });
+  const { client, requests } = mockClient([failure], { tools: [echo] });
+
+  await assert.rejects(
+    () => client.chat.completions.run({ model: "auto", messages: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.deepEqual(error.context, {
+        protocol: "chat",
+        phase: "initial_request",
+        requestNumber: 1,
+      });
+      return true;
+    },
+  );
+
+  assert.equal(requests.length, 1);
+  assert.equal(executions, 0);
+});
+
 test("Chat defaults auto-run without a duplicate first request", async () => {
   const { client, requests } = mockClient([
     chatResponse({ id: "first", toolName: "calculator", arguments: '{"expression":"(2 + 3) * 4"}' }),
@@ -261,6 +371,95 @@ test("Chat runStream keeps effective tools and reports text/tool callbacks", asy
   assert.deepEqual(deltas, ["done"]);
   assert.deepEqual(results, ["echoed"]);
   assert.equal(response.id, "cs2");
+});
+
+test("Chat runStream recursively merges and replays fragmented opaque tool metadata", async () => {
+  let executions = 0;
+  let executionExtraContent: unknown;
+  const first = new Response(
+    'data: {"id":"opaque-stream","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_opaque","type":"function","function":{"name":"echo"},"extra_content":{"google":{"thought_signature":"opaque-signature","first":true},"future_vendor":{"nested":{"a":1},"values":[1]}}}]},"finish_reason":null}]}\n\ndata: {"id":"opaque-stream","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"text\\":\\"hello\\"}"},"extra_content":{"google":{"second":"kept"},"future_vendor":{"nested":{"b":2},"values":[2,3]}}}]},"finish_reason":null}]}\n\ndata: {"id":"opaque-stream","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n',
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+  const final = new Response(
+    'data: {"id":"opaque-final","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+  const echo = defineTool({
+    name: "echo",
+    execute: (_input, context) => {
+      executions += 1;
+      executionExtraContent = context.toolCall.extra_content;
+      return "echoed";
+    },
+  });
+  const { client, requests } = mockClient([first, final], { tools: [echo] });
+
+  await client.chat.completions.runStream({ model: "auto", messages: [] });
+
+  const expected = {
+    google: { thought_signature: "opaque-signature", first: true, second: "kept" },
+    future_vendor: { nested: { a: 1, b: 2 }, values: [2, 3] },
+  };
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
+  assert.deepEqual(executionExtraContent, expected);
+  assert.deepEqual(requests[1]?.body.messages.at(-2)?.tool_calls[0]?.extra_content, expected);
+  assert.equal(requests[1]?.body.messages.at(-2)?.tool_calls[0]?.function.arguments, '{"text":"hello"}');
+  assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
+  assert.equal(requests[1]?.body.tools.length, 1);
+});
+
+test("Chat runStream annotates continuation errors without another tool execution", async () => {
+  let executions = 0;
+  const first = new Response(
+    'data: {"id":"stream-error","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_stream_error","type":"function","function":{"name":"echo","arguments":"{}"},"extra_content":{"vendor":{"opaque":"value"}}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n',
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+  const failure = new Response(JSON.stringify({ error: { message: "continuation rejected" } }), {
+    status: 400,
+    headers: { "Content-Type": "application/json" },
+  });
+  const echo = defineTool({ name: "echo", execute: () => { executions += 1; return "echoed"; } });
+  const { client, requests } = mockClient([first, failure], { tools: [echo] });
+
+  await assert.rejects(
+    () => client.chat.completions.runStream({ model: "auto", messages: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.deepEqual(error.context, {
+        protocol: "chat",
+        phase: "tool_continuation",
+        requestNumber: 2,
+        toolStep: 1,
+        toolCalls: [{ id: "call_stream_error", name: "echo", hasExtraContent: true }],
+      });
+      return true;
+    },
+  );
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
+});
+
+test("tool calls without extra_content do not synthesize empty provider metadata", async () => {
+  const echo = defineTool({ name: "echo", execute: () => "echoed" });
+  const chat = mockClient([
+    chatResponse({ toolName: "echo" }),
+    chatResponse({ content: "done" }),
+  ], { tools: [echo] });
+  await chat.client.chat.completions.run({ model: "auto", messages: [] });
+  const replayedCall = chat.requests[1]?.body.messages.at(-2)?.tool_calls[0];
+  assert.equal("extra_content" in replayedCall, false);
+
+  const messages = mockClient([chatResponse({ toolName: "echo" })]);
+  const response = await messages.client.messages.create({
+    model: "auto",
+    max_tokens: 32,
+    messages: [],
+    tools: [{ name: "echo", input_schema: { type: "object" } }],
+  });
+  const toolUse = response.content.find((block) => block.type === "tool_use")!;
+  assert.equal("extra_content" in toolUse, false);
 });
 
 test("Responses sends and preserves native Responses payloads", async () => {
@@ -447,6 +646,98 @@ test("Anthropic converts requests, tool history, tool_choice, response and usage
   assert.equal(response.content[0]?.text, "answer");
   assert.equal(response.stop_reason, "end_turn");
   assert.deepEqual(response.usage, { input_tokens: 2, output_tokens: 3 });
+});
+
+test("Anthropic tool_use round-trip preserves opaque extra_content in both directions", async () => {
+  const first = mockClient([
+    chatResponse({ toolName: "lookup", arguments: '{"id":"42"}', extraContent: opaqueExtraContent }),
+  ]);
+  const message = await first.client.messages.create({
+    model: "auto",
+    max_tokens: 32,
+    messages: [{ role: "user", content: "find" }],
+    tools: [{ name: "lookup", input_schema: { type: "object" } }],
+  });
+  const toolUse = message.content.find((block) => block.type === "tool_use");
+  assert.deepEqual(toolUse?.extra_content, opaqueExtraContent);
+
+  const continuation = mockClient([chatResponse({ content: "done" })]);
+  await continuation.client.messages.create({
+    model: "auto",
+    max_tokens: 32,
+    messages: [
+      { role: "assistant", content: message.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: toolUse?.id, content: "record" }] },
+    ],
+    tools: [{ name: "lookup", input_schema: { type: "object" } }],
+  });
+  assert.deepEqual(
+    continuation.requests[0]?.body.messages[0]?.tool_calls[0]?.extra_content,
+    opaqueExtraContent,
+  );
+});
+
+test("Anthropic run executes once and replays opaque tool_use metadata on the Chat continuation", async () => {
+  let executions = 0;
+  let executionExtraContent: unknown;
+  const lookup = defineTool({
+    name: "lookup",
+    execute: (_input, context) => {
+      executions += 1;
+      executionExtraContent = context.toolCall.extra_content;
+      return "record";
+    },
+  });
+  const { client, requests } = mockClient([
+    chatResponse({ toolName: "lookup", arguments: '{"id":42}', extraContent: opaqueExtraContent }),
+    chatResponse({ id: "anthropic-final", content: "record" }),
+  ], { tools: [lookup] });
+
+  await client.messages.run({
+    model: "auto",
+    max_tokens: 32,
+    messages: [{ role: "user", content: "find" }],
+  });
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
+  assert.deepEqual(executionExtraContent, opaqueExtraContent);
+  assert.deepEqual(requests[1]?.body.messages.at(-2)?.tool_calls[0]?.extra_content, opaqueExtraContent);
+  assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
+  assert.equal(requests[1]?.body.tools.length, 1);
+});
+
+test("Anthropic run identifies a failed tool continuation without changing tool execution", async () => {
+  let executions = 0;
+  const lookup = defineTool({ name: "lookup", execute: () => { executions += 1; return "record"; } });
+  const failure = new Response(JSON.stringify({ error: { message: "provider continuation failed" } }), {
+    status: 503,
+    headers: { "Content-Type": "application/json", "x-request-id": "req_messages_continuation" },
+  });
+  const { client, requests } = mockClient([
+    chatResponse({ toolName: "lookup", extraContent: opaqueExtraContent }),
+    failure,
+  ], { tools: [lookup] });
+
+  await assert.rejects(
+    () => client.messages.run({ model: "auto", max_tokens: 32, messages: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.equal(error.requestId, "req_messages_continuation");
+      assert.deepEqual(error.context, {
+        protocol: "messages",
+        phase: "tool_continuation",
+        requestNumber: 2,
+        toolStep: 1,
+        toolCalls: [{ id: "call_1", name: "lookup", hasExtraContent: true }],
+      });
+      return true;
+    },
+  );
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
+  assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
 });
 
 test("Anthropic marks Gateway usage as unavailable instead of returning missing token fields", async () => {
@@ -653,7 +944,7 @@ test("Anthropic stream delays message_start for metadata-only Chat events and ma
 
 test("Anthropic stream converts fragmented Chat tool calls to tool_use JSON deltas", async () => {
   const sse = new Response(
-    'data: {"id":"at","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_at","type":"function","function":{"name":"lookup","arguments":"{\\\"id\\\":"}}]},"finish_reason":null}]}\n\ndata: {"id":"at","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"7}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n',
+    'data: {"id":"at","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_at","type":"function","function":{"name":"lookup","arguments":"{\\\"id\\\":"},"extra_content":{"google":{"thought_signature":"opaque-signature"},"future_vendor":{"nested":{"a":1}}}}]},"finish_reason":null}]}\n\ndata: {"id":"at","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"7}"},"extra_content":{"google":{"second":"kept"},"future_vendor":{"nested":{"b":2}}}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n',
     { headers: { "Content-Type": "text/event-stream" } },
   );
   const { client } = mockClient([sse]);
@@ -662,6 +953,10 @@ test("Anthropic stream converts fragmented Chat tool calls to tool_use JSON delt
   const start = events.find((event) => event.type === "content_block_start");
   assert.equal(start?.content_block?.type, "tool_use");
   assert.equal(start?.content_block?.name, "lookup");
+  assert.deepEqual(start?.content_block?.extra_content, {
+    google: { thought_signature: "opaque-signature", second: "kept" },
+    future_vendor: { nested: { a: 1, b: 2 } },
+  });
   assert.equal(
     events.filter((event) => event.type === "content_block_delta").map((event) => event.delta?.partial_json).join(""),
     '{"id":7}',
@@ -710,7 +1005,7 @@ test("Anthropic runStream executes the selected handler once and returns the fin
     },
   });
   const first = new Response(
-    'data: {"id":"anth_stream_first","model":"first-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_stream","type":"function","function":{"name":"lookup","arguments":"{\\"id\\":9}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: {"id":"anth_stream_first","model":"first-model","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\ndata: [DONE]\n\n',
+    'data: {"id":"anth_stream_first","model":"first-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_stream","type":"function","function":{"name":"lookup"},"extra_content":{"google":{"thought_signature":"opaque-signature"},"future_vendor":{"nested":{"a":1}}}}]},"finish_reason":null}]}\n\ndata: {"id":"anth_stream_first","model":"first-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"id\\":9}"},"extra_content":{"future_vendor":{"nested":{"b":2}}}}]},"finish_reason":"tool_calls"}]}\n\ndata: {"id":"anth_stream_first","model":"first-model","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\ndata: [DONE]\n\n',
     { headers: { "Content-Type": "text/event-stream" } },
   );
   const final = new Response(
@@ -737,6 +1032,10 @@ test("Anthropic runStream executes the selected handler once and returns the fin
   assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
   assert.equal(requests[1]?.body.messages.at(-1)?.role, "tool");
   assert.equal(requests[1]?.body.messages.at(-1)?.tool_call_id, "call_stream");
+  assert.deepEqual(requests[1]?.body.messages.at(-2)?.tool_calls[0]?.extra_content, {
+    google: { thought_signature: "opaque-signature" },
+    future_vendor: { nested: { a: 1, b: 2 } },
+  });
   assert.equal(executions, 1);
   assert.equal(toolResults.length, 1);
   assert.match(toolResults[0] ?? "", /"id":9/);
@@ -745,6 +1044,38 @@ test("Anthropic runStream executes the selected handler once and returns the fin
   assert.equal(response.model, "final-model");
   assert.equal(response.stop_reason, "end_turn");
   assert.deepEqual(response.usage, { input_tokens: 8, output_tokens: 2 });
+});
+
+test("Anthropic runStream reports continuation context and executes the tool once", async () => {
+  let executions = 0;
+  const first = new Response(
+    'data: {"id":"anthropic-error","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_anthropic_error","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n',
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+  const failure = new Response(JSON.stringify({ error: { message: "continuation failed" } }), {
+    status: 400,
+    headers: { "Content-Type": "application/json" },
+  });
+  const lookup = defineTool({ name: "lookup", execute: () => { executions += 1; return "record"; } });
+  const { client, requests } = mockClient([first, failure], { tools: [lookup] });
+
+  await assert.rejects(
+    () => client.messages.runStream({ model: "auto", max_tokens: 32, messages: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.deepEqual(error.context, {
+        protocol: "messages",
+        phase: "tool_continuation",
+        requestNumber: 2,
+        toolStep: 1,
+        toolCalls: [{ id: "call_anthropic_error", name: "lookup", hasExtraContent: false }],
+      });
+      return true;
+    },
+  );
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
 });
 
 test("Base URL variants derive exactly one Chat Completions endpoint", async () => {
