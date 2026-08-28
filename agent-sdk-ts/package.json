@@ -21,6 +21,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./toolkit": {
+      "types": "./dist/toolkit/index.d.ts",
+      "import": "./dist/toolkit/index.js"
     }
   },
   "files": ["dist", "README.md", "LICENSE", "NOTICE"],

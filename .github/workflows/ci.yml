@@ -1,0 +1,28 @@
+name: TypeScript SDK CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm typecheck
+      - name: Verify committed distribution files
+        run: git diff --exit-code -- client-sdk-ts/dist agent-sdk-ts/dist

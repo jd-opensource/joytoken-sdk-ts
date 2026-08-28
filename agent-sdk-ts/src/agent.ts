@@ -91,17 +91,29 @@ export class Agent {
           toolCallId: toolCall.id,
           toolName: toolCall.function.name,
           content: `Tool not found: ${toolCall.function.name}`,
+          isError: true,
         });
         continue;
       }
 
       const input = parseToolArguments(toolCall.function.arguments);
-      const output = await tool.execute(input, { step, toolCall, messages });
-      results.push({
-        toolCallId: toolCall.id,
-        toolName: tool.name,
-        content: stringifyToolResult(output),
-      });
+      try {
+        const output = await tool.execute(input, { step, toolCall, messages });
+        results.push({
+          toolCallId: toolCall.id,
+          toolName: tool.name,
+          content: stringifyToolResult(output),
+        });
+      } catch (error) {
+        // A tool throwing must not abort the whole run. Feed the error back to
+        // the model as an observation so it can self-correct on the next step.
+        results.push({
+          toolCallId: toolCall.id,
+          toolName: tool.name,
+          content: `Tool error: ${errorMessage(error)}`,
+          isError: true,
+        });
+      }
     }
 
     return results;
@@ -115,6 +127,11 @@ function parseToolArguments(value: string): unknown {
   } catch {
     return { raw: value };
   }
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 function lastAssistantText(messages: ChatMessage[]): string {

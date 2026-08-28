@@ -66,20 +66,20 @@ const message = await joytoken.messages.create({
 console.log(message.content[0]?.text);
 ```
 
-The client supports:
+The Gateway exposes native Chat Completions and Responses endpoints. Only Anthropic Messages is converted to and from Chat Completions inside the SDK. The client supports:
 
 - `POST /openai/v1/chat/completions`
 - streaming chat completions via SSE
-- `POST /openai/v1/responses`
-- streaming Responses text events via SSE
+- `POST /openai/v1/responses`, including native output items and native SSE events
 - `POST /openai/v1/images/generations`
-- `POST /anthropic/v1/messages`
-- streaming Anthropic Messages via SSE
+- SDK-side Anthropic Messages compatibility, including streaming events
 - `GET /api/v1/models`
 - `GET /api/v1/models/meta`
 - `GET /api/v1/pricing`
 
-The default endpoint is `https://api.joytokens.ai`; requests time out after 60 seconds by default. Pass `timeoutMs: 0` to disable the SDK timeout, or pass `apiBaseUrl`, `openAIBaseUrl`, and `anthropicBaseUrl` to target another environment. Authenticated model calls, model metadata and pricing requests fail locally when the API key is missing; `models.list()` remains unauthenticated. HTTP failures throw `JoyTokenAPIError` with the status, request ID, response headers, and parsed response body.
+The default endpoint is `https://api.joytokens.ai`; requests time out after 60 seconds by default. Pass `timeoutMs: 0` to disable the SDK timeout, or pass `apiBaseUrl`/`openAIBaseUrl` to target another environment. `anthropicBaseUrl` remains accepted for source compatibility but never routes to a separate Messages endpoint. Authenticated model calls, model metadata and pricing requests fail locally when the API key is missing; `models.list()` remains unauthenticated. HTTP failures throw `JoyTokenAPIError` with the status, request ID, response headers, and parsed response body.
+
+Tool ownership is exclusive. An explicit `request.tools` value, including `[]`, is sent without SDK defaults. Otherwise Client-registered tools are used alone. Only when neither exists are local SDK defaults injected and allowed to auto-run. Every tool-loop turn carries the same resolved tools and request options exactly once. `create` and raw `stream` never execute user tools; call `run`/`executeTools` or the streaming `runStream`/`executeToolsStream` entry points to execute Client-registered handlers. Responses tools stay in the native flat shape, and `function_call_output` items are appended to native Responses input. Responses hosted defaults are disabled unless `defaultBuiltinTools: true` is set; hosted `file_search` must be supplied by the caller with its `vector_store_ids`.
 
 All model requests require `model: "auto"`; concrete model IDs are rejected before a network request is sent.
 

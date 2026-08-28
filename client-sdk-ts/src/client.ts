@@ -3,6 +3,8 @@ import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
   ChatCompletionStreamRequest,
+  ChatMessage,
+  ChatTool,
   ImageGenerationRequest,
   ImageGenerationResponse,
   JoyTokenClientOptions,
@@ -11,19 +13,53 @@ import type {
   MessageResponse,
   MessageStreamEvent,
   MessageStreamRequest,
+  MessageTool,
   ModelInfo,
   ModelListResponse,
   ModelMetadataResponse,
   PricingResponse,
   Response as JoyTokenResponse,
+  ResponseInputItem,
   ResponseRequest,
+  ResponseOutputItem,
   ResponseStreamEvent,
   ResponseStreamRequest,
+  ResponseTool,
+  ToolCall,
+  ToolCallResult,
+  ToolRunStreamOptions,
 } from "./types.js";
+import {
+  calculator,
+  dateTime,
+  parseToolArguments,
+  safeExecuteTool,
+  stringifyToolResult,
+  toChatTool,
+  toResponseTool,
+  type Tool,
+  type ToolExecutionContext,
+} from "./tools.js";
+import {
+  chatResponseToMessage,
+  chatStreamToMessages,
+  messageRequestToChat,
+  messageToolToChat,
+  type ChatWireTool,
+} from "./compat.js";
+import { fileRead, fileWrite, listDir, fileSearch, absRoot } from "./file-tools.js";
+import { gateFileWrite, type FilePermissionFunc } from "./file-permission.js";
+import { shell, absWorkingDir } from "./shell-tools.js";
+import { gateShell, type ShellPermissionFunc } from "./shell-permission.js";
+import { FinishReasonKind, classifyFinishReason, malformedToolCallNudge } from "./finish-reason.js";
 
 const DEFAULT_API_BASE_URL = "https://api.joytokens.ai";
 const SDK_VERSION = "0.2.0";
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_MAX_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 500;
+const RETRY_MAX_DELAY_MS = 8_000;
+const DEFAULT_TOOL_MAX_STEPS = 8;
 const STREAM_DONE = Symbol("stream-done");
 
 interface ActiveRequest {
@@ -35,16 +71,49 @@ interface RawModelListResponse extends Omit<ModelListResponse, "data"> {
   data: ModelInfo[] | { models?: ModelInfo[] };
 }
 
+interface ToolPlan<TDeclaration> {
+  declarations: TDeclaration[] | undefined;
+  executables: Map<string, Tool>;
+  automatic: boolean;
+}
+
+export type ErrorCode =
+  | "rate_limited"
+  | "server_error"
+  | "timeout"
+  | "network"
+  | "invalid_request"
+  | "authentication"
+  | "permission"
+  | "not_found"
+  | "unknown";
+
+/** Maps an HTTP status code to a provider-neutral ErrorCode, aligned with the Go SDK. */
+function classifyStatus(status: number): ErrorCode {
+  if (status === 429) return "rate_limited";
+  if (status === 401) return "authentication";
+  if (status === 403) return "permission";
+  if (status === 404) return "not_found";
+  if (status === 400 || status === 422) return "invalid_request";
+  if (status >= 500 && status <= 599) return "server_error";
+  return "unknown";
+}
+
 export class JoyTokenAPIError extends Error {
   readonly status: number;
+  readonly code: ErrorCode;
   readonly requestId?: string;
   readonly responseHeaders: Headers;
   readonly body: unknown;
 
-  constructor(message: string, options: { status: number; responseHeaders: Headers; body: unknown; requestId?: string }) {
+  constructor(
+    message: string,
+    options: { status: number; code: ErrorCode; responseHeaders: Headers; body: unknown; requestId?: string },
+  ) {
     super(message);
     this.name = "JoyTokenAPIError";
     this.status = options.status;
+    this.code = options.code;
     this.responseHeaders = options.responseHeaders;
     this.body = options.body;
     this.requestId = options.requestId;
@@ -54,20 +123,74 @@ export class JoyTokenAPIError extends Error {
 export class JoyTokenClient {
   readonly apiBaseUrl: string;
   readonly openAIBaseUrl: string;
+  /** @deprecated Messages are adapted locally and do not request this URL. */
   readonly anthropicBaseUrl: string;
+  /** @deprecated Messages are adapted locally and use the Chat Completions headers. */
   readonly anthropicVersion: string;
   readonly timeoutMs: number;
+  readonly maxRetries: number;
 
   private readonly apiKey?: string;
   private readonly fetcher: typeof fetch;
   private readonly defaultHeaders: Record<string, string>;
+  private readonly chatCompletionsUrl: string;
+  private readonly responsesUrl: string;
+
+  private readonly registeredTools: Tool[];
+  private readonly defaultLocalTools: boolean;
+  private readonly defaultBuiltinTools: boolean;
+  private readonly toolMaxSteps: number;
+  private readonly fileWorkspace?: string;
+  private readonly filePermission?: FilePermissionFunc;
+  private readonly shellWorkspace?: string;
+  private readonly shellPermission?: ShellPermissionFunc;
+  private readonly excludedDefaultTools: Set<string>;
 
   readonly chat = {
     completions: {
       create: (request: ChatCompletionRequest): Promise<ChatCompletionResponse> => this.createChatCompletion(request),
+      run: (request: ChatCompletionRequest): Promise<ChatCompletionResponse> => this.runChatCompletionExplicit(request),
+      executeTools: (request: ChatCompletionRequest): Promise<ChatCompletionResponse> =>
+        this.runChatCompletionExplicit(request),
       stream: (request: Omit<ChatCompletionStreamRequest, "stream">): AsyncIterable<ChatCompletionChunk> =>
         this.streamChatCompletion({ ...request, stream: true }),
+      runStream: (
+        request: Omit<ChatCompletionStreamRequest, "stream">,
+        options: ToolRunStreamOptions = {},
+      ): Promise<ChatCompletionResponse> => this.runChatCompletionStreamExplicit(request, options),
+      executeToolsStream: (
+        request: Omit<ChatCompletionStreamRequest, "stream">,
+        options: ToolRunStreamOptions = {},
+      ): Promise<ChatCompletionResponse> => this.runChatCompletionStreamExplicit(request, options),
     },
+  };
+
+  readonly responses = {
+    create: (request: ResponseRequest): Promise<JoyTokenResponse> => this.createResponse(request),
+    run: (request: ResponseRequest): Promise<JoyTokenResponse> => this.runResponseExplicit(request),
+    executeTools: (request: ResponseRequest): Promise<JoyTokenResponse> => this.runResponseExplicit(request),
+    stream: (request: ResponseRequest): AsyncIterable<ResponseStreamEvent> =>
+      this.streamResponse({ ...request, stream: true }),
+    runStream: (request: ResponseRequest, options: ToolRunStreamOptions = {}): Promise<JoyTokenResponse> =>
+      this.runResponseStreamExplicit(request, options),
+    executeToolsStream: (request: ResponseRequest, options: ToolRunStreamOptions = {}): Promise<JoyTokenResponse> =>
+      this.runResponseStreamExplicit(request, options),
+  };
+
+  readonly messages = {
+    create: (request: MessageRequest): Promise<MessageResponse> => this.createMessage(request),
+    run: (request: MessageRequest): Promise<MessageResponse> => this.runMessageExplicit(request),
+    executeTools: (request: MessageRequest): Promise<MessageResponse> => this.runMessageExplicit(request),
+    stream: (request: MessageRequest): AsyncIterable<MessageStreamEvent> =>
+      this.streamMessage({ ...request, stream: true }),
+    runStream: (
+      request: MessageRequest,
+      options: ToolRunStreamOptions = {},
+    ): Promise<MessageResponse> => this.runMessageStreamExplicit(request, options),
+    executeToolsStream: (
+      request: MessageRequest,
+      options: ToolRunStreamOptions = {},
+    ): Promise<MessageResponse> => this.runMessageStreamExplicit(request, options),
   };
 
   readonly models = {
@@ -83,32 +206,37 @@ export class JoyTokenClient {
     retrieve: (): Promise<PricingResponse> => this.getPricing(),
   };
 
-  readonly messages = {
-    create: (request: MessageRequest): Promise<MessageResponse> => this.createMessage(request),
-    stream: (request: Omit<MessageStreamRequest, "stream">): AsyncIterable<MessageStreamEvent> =>
-      this.streamMessage({ ...request, stream: true }),
-  };
-
-  readonly responses = {
-    create: (request: ResponseRequest): Promise<JoyTokenResponse> => this.createResponse(request),
-    stream: (request: Omit<ResponseStreamRequest, "stream">): AsyncIterable<ResponseStreamEvent> =>
-      this.streamResponse({ ...request, stream: true }),
-  };
-
   constructor(options: JoyTokenClientOptions = {}) {
     const env = globalThis.process?.env;
     this.apiKey = options.apiKey ?? env?.JOY_TOKEN_API_KEY;
-    this.apiBaseUrl = trimTrailingSlash(options.apiBaseUrl ?? env?.JOY_TOKEN_API_BASE_URL ?? DEFAULT_API_BASE_URL);
-    this.openAIBaseUrl = trimTrailingSlash(
-      options.openAIBaseUrl ?? env?.JOY_TOKEN_OPENAI_BASE_URL ?? `${this.apiBaseUrl}/openai/v1`,
-    );
-    this.anthropicBaseUrl = trimTrailingSlash(
-      options.anthropicBaseUrl ?? env?.JOY_TOKEN_ANTHROPIC_BASE_URL ?? `${this.apiBaseUrl}/anthropic/v1`,
-    );
+    const configuredApiBase = options.apiBaseUrl ?? env?.JOY_TOKEN_API_BASE_URL;
+    const configuredAnthropicBase = options.anthropicBaseUrl ?? env?.JOY_TOKEN_ANTHROPIC_BASE_URL;
+    this.apiBaseUrl = trimTrailingSlash(configuredApiBase ?? DEFAULT_API_BASE_URL);
+    const configuredModelBase =
+      options.openAIBaseUrl ??
+      env?.JOY_TOKEN_OPENAI_BASE_URL ??
+      configuredApiBase ??
+      configuredAnthropicBase ??
+      DEFAULT_API_BASE_URL;
+    this.openAIBaseUrl = deriveOpenAIBaseUrl(configuredModelBase);
+    this.chatCompletionsUrl = `${this.openAIBaseUrl}/chat/completions`;
+    this.responsesUrl = `${this.openAIBaseUrl}/responses`;
+    this.anthropicBaseUrl = trimTrailingSlash(configuredAnthropicBase ?? `${this.apiBaseUrl}/anthropic/v1`);
     this.anthropicVersion = options.anthropicVersion ?? "2023-06-01";
     this.fetcher = options.fetch ?? globalThis.fetch;
     this.defaultHeaders = options.defaultHeaders ?? {};
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.maxRetries = options.maxRetries !== undefined && options.maxRetries > 0 ? options.maxRetries : options.maxRetries === 0 ? 0 : DEFAULT_MAX_RETRIES;
+
+    this.registeredTools = options.tools ? [...options.tools] : [];
+    this.defaultLocalTools = options.defaultLocalTools ?? true;
+    this.defaultBuiltinTools = options.defaultBuiltinTools ?? false;
+    this.toolMaxSteps = options.toolMaxSteps && options.toolMaxSteps > 0 ? options.toolMaxSteps : DEFAULT_TOOL_MAX_STEPS;
+    this.fileWorkspace = options.fileWorkspace;
+    this.filePermission = options.filePermission;
+    this.shellWorkspace = options.shellWorkspace;
+    this.shellPermission = options.shellPermission;
+    this.excludedDefaultTools = new Set((options.excludedDefaultTools ?? []).filter((name) => name !== ""));
 
     if (!this.fetcher) {
       throw new Error("No fetch implementation available. Pass JoyTokenClient({ fetch }) in this runtime.");
@@ -116,25 +244,234 @@ export class JoyTokenClient {
   }
 
   private async createChatCompletion(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+    const plan = this.chatToolPlan(request.tools);
+    return this.completeChat(request, plan, plan.automatic);
+  }
+
+  private async runChatCompletionExplicit(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+    return this.completeChat(request, this.chatToolPlan(request.tools), true);
+  }
+
+  private async completeChat(
+    request: ChatCompletionRequest,
+    plan: ToolPlan<ChatWireTool>,
+    executeTools: boolean,
+  ): Promise<ChatCompletionResponse> {
+    const first = await this.createChatCompletionOnce(request, plan.declarations);
+    if (!executeTools) return first;
+    return this.runChatCompletion(request, plan, first);
+  }
+
+  /**
+   * createChatCompletionOnce injects tool declarations and performs a single
+   * non-streaming request. It never executes tool calls, so it is safe to call
+   * from the tool-calling loop without risking recursion.
+   */
+  private async createChatCompletionOnce(
+    request: ChatCompletionRequest,
+    declarations: ChatWireTool[] | undefined,
+  ): Promise<ChatCompletionResponse> {
     this.requireAutoModel(request.model);
     this.requireAPIKey();
     if (request.stream) {
       throw new Error("Use joytoken.chat.completions.stream() for streaming responses.");
     }
 
-    return this.requestJSON<ChatCompletionResponse>(`${this.openAIBaseUrl}/chat/completions`, {
+    const { tools: _requestTools, ...rest } = request;
+    const body = {
+      ...rest,
+      stream: false,
+      ...(declarations === undefined ? {} : { tools: declarations }),
+    };
+
+    return this.requestJSON<ChatCompletionResponse>(this.chatCompletionsUrl, {
       method: "POST",
-      body: JSON.stringify({ ...request, stream: false }),
+      body: JSON.stringify(body),
     });
   }
 
+  /**
+   * runChatCompletion drives the multi-turn tool-calling loop. Each turn sends
+   * the accumulated messages, executes any tool calls whose name maps to a
+   * registered executable tool, and appends the tool outputs before the next
+   * turn. It stops on a plain stop finish, when no executable tool calls remain,
+   * or when the step budget is exhausted.
+   */
+  private async runChatCompletion(
+    request: ChatCompletionRequest,
+    plan: ToolPlan<ChatWireTool>,
+    first: ChatCompletionResponse,
+  ): Promise<ChatCompletionResponse> {
+    const messages: ChatMessage[] = [...(request.messages as ChatMessage[])];
+    let response = first;
+
+    for (let step = 0; step < this.toolMaxSteps; step += 1) {
+      const choice = response.choices?.[0];
+      const message = choice?.message;
+      if (!message) {
+        return response;
+      }
+
+      messages.push(message);
+      const kind = classifyFinishReason(choice?.finish_reason);
+      const toolCalls = message.tool_calls ?? [];
+
+      if (kind === FinishReasonKind.MalformedToolCall && toolCalls.length === 0) {
+        messages.push({ role: "user", content: malformedToolCallNudge });
+        response = await this.createChatCompletionOnce({ ...request, messages }, plan.declarations);
+        continue;
+      }
+
+      if (toolCalls.length === 0) {
+        return response;
+      }
+      for (const toolCall of toolCalls) {
+        const result = await this.runTool(plan.executables, step, toolCall, messages);
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          name: toolCall.function?.name,
+          content: result.content,
+        });
+      }
+      response = await this.createChatCompletionOnce({ ...request, messages }, plan.declarations);
+    }
+
+    return response;
+  }
+
   private async *streamChatCompletion(request: ChatCompletionStreamRequest): AsyncIterable<ChatCompletionChunk> {
+    const plan = this.chatToolPlan(request.tools as ChatTool[] | undefined);
+    yield* this.streamChatCompletionWire(request, plan.declarations);
+  }
+
+  private async runChatCompletionStreamExplicit(
+    request: Omit<ChatCompletionStreamRequest, "stream">,
+    options: ToolRunStreamOptions,
+  ): Promise<ChatCompletionResponse> {
+    const plan = this.chatToolPlan(request.tools as ChatTool[] | undefined);
+    return this.runChatCompletionStream(request, plan, options);
+  }
+
+  private async runChatCompletionStream(
+    request: Omit<ChatCompletionStreamRequest, "stream">,
+    plan: ToolPlan<ChatWireTool>,
+    options: ToolRunStreamOptions,
+  ): Promise<ChatCompletionResponse> {
+    const messages: ChatMessage[] = [...(request.messages as ChatMessage[])];
+    let response: ChatCompletionResponse | undefined;
+
+    for (let step = 0; step < this.toolMaxSteps; step += 1) {
+      response = await this.collectChatStreamTurn(
+        { ...request, messages, stream: true },
+        plan.declarations,
+        options.onTextDelta,
+      );
+      const message = response.choices[0]?.message;
+      if (!message) return response;
+      messages.push(message);
+      const toolCalls = message.tool_calls ?? [];
+      if (toolCalls.length === 0) return response;
+      for (const toolCall of toolCalls) {
+        const result = await this.runTool(plan.executables, step, toolCall, messages);
+        options.onToolResult?.(result);
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          name: toolCall.function?.name,
+          content: result.content,
+        });
+      }
+    }
+    return response ?? emptyChatResponse();
+  }
+
+  private async collectChatStreamTurn(
+    request: ChatCompletionStreamRequest,
+    declarations: ChatWireTool[] | undefined,
+    onTextDelta?: (delta: string) => void,
+  ): Promise<ChatCompletionResponse> {
+    let id: string | undefined;
+    let object: string | undefined;
+    let created: number | undefined;
+    let model: string | undefined;
+    let usage: ChatCompletionResponse["usage"];
+    let finishReason: string | null | undefined;
+    let content = "";
+    let extraMetadata: Record<string, unknown> = {};
+    const calls = new Map<number, { id: string; name: string; arguments: string }>();
+    for await (const chunk of this.streamChatCompletionWire(request, declarations)) {
+      const {
+        id: _id,
+        object: _object,
+        created: _created,
+        model: _model,
+        choices: _choices,
+        usage: _usage,
+        ...chunkMetadata
+      } = chunk;
+      extraMetadata = { ...extraMetadata, ...chunkMetadata };
+      id = chunk.id ?? id;
+      object = chunk.object ?? object;
+      created = chunk.created ?? created;
+      model = chunk.model ?? model;
+      usage = chunk.usage ?? usage;
+      for (const choice of chunk.choices ?? []) {
+        finishReason = choice.finish_reason ?? finishReason;
+        const delta = choice.delta as Partial<ChatMessage> & { tool_calls?: Array<Record<string, unknown>> };
+        const text = chatContentText(delta.content);
+        if (text) {
+          content += text;
+          onTextDelta?.(text);
+        }
+        for (const raw of delta.tool_calls ?? []) {
+          const index = typeof raw.index === "number" ? raw.index : 0;
+          const fn = (raw.function ?? {}) as Record<string, unknown>;
+          const call = calls.get(index) ?? { id: "", name: "", arguments: "" };
+          if (typeof raw.id === "string" && raw.id) call.id = raw.id;
+          if (typeof fn.name === "string") call.name += fn.name;
+          if (typeof fn.arguments === "string") call.arguments += fn.arguments;
+          calls.set(index, call);
+        }
+      }
+    }
+    return {
+      ...extraMetadata,
+      ...(id === undefined ? {} : { id }),
+      ...(object === undefined ? {} : { object }),
+      ...(created === undefined ? {} : { created }),
+      ...(model === undefined ? {} : { model }),
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: content || null,
+          ...(calls.size
+            ? { tool_calls: [...calls.values()].map((call) => ({ id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments } })) }
+            : {}),
+        },
+        finish_reason: finishReason,
+      }],
+      ...(usage === undefined ? {} : { usage }),
+    };
+  }
+
+  private async *streamChatCompletionWire(
+    request: ChatCompletionStreamRequest,
+    declarations: ChatWireTool[] | undefined,
+  ): AsyncIterable<ChatCompletionChunk> {
     this.requireAutoModel(request.model);
     this.requireAPIKey();
-    const activeRequest = await this.requestRaw(`${this.openAIBaseUrl}/chat/completions`, {
+    const { tools: _requestTools, ...rest } = request;
+    const activeRequest = await this.requestRaw(this.chatCompletionsUrl, {
       method: "POST",
       headers: { Accept: "text/event-stream" },
-      body: JSON.stringify({ ...request, stream: true }),
+      body: JSON.stringify({
+        ...rest,
+        stream: true,
+        stream_options: { ...(request.stream_options as Record<string, unknown> | undefined), include_usage: true },
+        ...(declarations === undefined ? {} : { tools: declarations }),
+      }),
     });
 
     try {
@@ -145,32 +482,183 @@ export class JoyTokenClient {
   }
 
   private async createResponse(request: ResponseRequest): Promise<JoyTokenResponse> {
+    const plan = this.responseToolPlan(request.tools);
+    if (!plan.automatic) return this.createResponseOnce(request, plan.declarations);
+    return this.completeResponse(request, plan);
+  }
+
+  private async runResponseExplicit(request: ResponseRequest): Promise<JoyTokenResponse> {
+    return this.completeResponse(request, this.responseToolPlan(request.tools));
+  }
+
+  private async runResponseStreamExplicit(
+    request: ResponseRequest,
+    options: ToolRunStreamOptions,
+  ): Promise<JoyTokenResponse> {
+    return this.completeResponse(request, this.responseToolPlan(request.tools), options);
+  }
+
+  private async createResponseOnce(
+    request: ResponseRequest,
+    declarations: ResponseTool[] | undefined,
+  ): Promise<JoyTokenResponse> {
     this.requireAutoModel(request.model);
     this.requireAPIKey();
-    if (request.stream) {
-      throw new Error("Use joytoken.responses.stream() for streaming responses.");
-    }
-
-    return this.requestJSON<JoyTokenResponse>(`${this.openAIBaseUrl}/responses`, {
+    if (request.stream) throw new Error("Use joytoken.responses.stream() for streaming responses.");
+    const { tools: _requestTools, ...rest } = request;
+    const response = await this.requestJSON<JoyTokenResponse>(this.responsesUrl, {
       method: "POST",
-      body: JSON.stringify({ ...request, stream: false }),
+      body: JSON.stringify({
+        ...rest,
+        stream: false,
+        ...(declarations === undefined ? {} : { tools: declarations }),
+      }),
     });
+    return withResponseOutputText(response);
+  }
+
+  private async completeResponse(
+    request: ResponseRequest,
+    plan: ToolPlan<ResponseTool>,
+    streamOptions?: ToolRunStreamOptions,
+  ): Promise<JoyTokenResponse> {
+    let input = normalizeResponseInput(request.input);
+    const chained = request.previous_response_id !== undefined;
+    let previousResponseId = request.previous_response_id;
+    const requestTurn = async (): Promise<JoyTokenResponse> => {
+      const stepRequest: ResponseRequest = {
+        ...request,
+        input,
+        ...(previousResponseId === undefined ? {} : { previous_response_id: previousResponseId }),
+      };
+      return streamOptions
+        ? await this.collectResponseStreamTurn({ ...stepRequest, stream: true }, plan.declarations, streamOptions.onTextDelta)
+        : await this.createResponseOnce(stepRequest, plan.declarations);
+    };
+    let response = await requestTurn();
+
+    for (let step = 0; step < this.toolMaxSteps; step += 1) {
+      const calls = responseFunctionCalls(response);
+      if (calls.length === 0) return response;
+
+      const replay = chained ? [] : [...input, ...(response.output ?? []).map(responseOutputToInput)];
+      const outputs: ResponseInputItem[] = [];
+      for (const call of calls) {
+        const toolCall: ToolCall = {
+          id: call.call_id ?? call.id ?? "",
+          type: "function",
+          function: { name: call.name ?? "", arguments: call.arguments ?? "" },
+        };
+        const result = await this.runTool(
+          plan.executables,
+          step,
+          toolCall,
+          responseInputToContextMessages(chained ? [...input, responseOutputToInput(call)] : replay, request.instructions),
+        );
+        streamOptions?.onToolResult?.(result);
+        outputs.push({
+          type: "function_call_output",
+          call_id: result.tool_call_id,
+          output: result.content,
+        });
+      }
+      input = [...replay, ...outputs];
+      if (chained) previousResponseId = response.id;
+      response = await requestTurn();
+    }
+    return response;
   }
 
   private async *streamResponse(request: ResponseStreamRequest): AsyncIterable<ResponseStreamEvent> {
+    const plan = this.responseToolPlan(request.tools as ResponseTool[] | undefined);
+    yield* this.streamResponseWire(request, plan.declarations);
+  }
+
+  private async *streamResponseWire(
+    request: ResponseStreamRequest,
+    declarations: ResponseTool[] | undefined,
+  ): AsyncIterable<ResponseStreamEvent> {
     this.requireAutoModel(request.model);
     this.requireAPIKey();
-    const activeRequest = await this.requestRaw(`${this.openAIBaseUrl}/responses`, {
+    const { tools: _requestTools, ...rest } = request;
+    const activeRequest = await this.requestRaw(this.responsesUrl, {
       method: "POST",
       headers: { Accept: "text/event-stream" },
-      body: JSON.stringify({ ...request, stream: true }),
+      body: JSON.stringify({
+        ...rest,
+        stream: true,
+        ...(declarations === undefined ? {} : { tools: declarations }),
+      }),
     });
-
     try {
       yield* readSSE<ResponseStreamEvent>(activeRequest.response);
     } finally {
       activeRequest.cleanup();
     }
+  }
+
+  private async collectResponseStreamTurn(
+    request: ResponseStreamRequest,
+    declarations: ResponseTool[] | undefined,
+    onTextDelta?: (delta: string) => void,
+  ): Promise<JoyTokenResponse> {
+    let terminalResponse: JoyTokenResponse | undefined;
+    const output: Array<ResponseOutputItem | undefined> = [];
+    for await (const event of this.streamResponseWire(request, declarations)) {
+      if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+        onTextDelta?.(event.delta);
+      }
+      if (event.type === "response.output_item.done" && event.item) {
+        output[event.output_index ?? output.length] = event.item;
+      }
+      if (event.type === "error") {
+        throw new Error(`JoyToken Responses stream error: ${JSON.stringify(event.error ?? event)}`);
+      }
+      if (
+        event.response &&
+        (event.type === "response.completed" || event.type === "response.incomplete" || event.type === "response.failed")
+      ) {
+        terminalResponse = event.response;
+      }
+    }
+    if (!terminalResponse) {
+      throw new Error("JoyToken Responses stream ended without a terminal response event.");
+    }
+    const collectedOutput = output.filter((item): item is ResponseOutputItem => item !== undefined);
+    const response = terminalResponse.output === undefined && collectedOutput.length > 0
+      ? { ...terminalResponse, output: collectedOutput }
+      : terminalResponse;
+    return withResponseOutputText(response);
+  }
+
+  private async createMessage(request: MessageRequest): Promise<MessageResponse> {
+    const plan = this.messageToolPlan(request.tools);
+    const response = await this.completeChat(messageRequestToChat(request, plan.declarations as ChatTool[] | undefined), plan, plan.automatic);
+    return chatResponseToMessage(response);
+  }
+
+  private async runMessageExplicit(request: MessageRequest): Promise<MessageResponse> {
+    const plan = this.messageToolPlan(request.tools);
+    const response = await this.completeChat(messageRequestToChat(request, plan.declarations as ChatTool[] | undefined), plan, true);
+    return chatResponseToMessage(response);
+  }
+
+  private async *streamMessage(request: MessageStreamRequest): AsyncIterable<MessageStreamEvent> {
+    const plan = this.messageToolPlan(request.tools as MessageTool[] | undefined);
+    const chatRequest = messageRequestToChat(request, plan.declarations as ChatTool[] | undefined);
+    yield* chatStreamToMessages(
+      this.streamChatCompletionWire({ ...chatRequest, stream: true }, plan.declarations),
+    );
+  }
+
+  private async runMessageStreamExplicit(
+    request: MessageRequest,
+    options: ToolRunStreamOptions,
+  ): Promise<MessageResponse> {
+    const plan = this.messageToolPlan(request.tools);
+    const chatRequest = messageRequestToChat(request, plan.declarations as ChatTool[] | undefined);
+    const response = await this.runChatCompletionStream(chatRequest, plan, options);
+    return chatResponseToMessage(response);
   }
 
   private async generateImage(request: ImageGenerationRequest): Promise<ImageGenerationResponse> {
@@ -180,44 +668,6 @@ export class JoyTokenClient {
       method: "POST",
       body: JSON.stringify(request),
     });
-  }
-
-  private async createMessage(request: MessageRequest): Promise<MessageResponse> {
-    this.requireAutoModel(request.model);
-    this.requireAPIKey();
-    if (request.stream) {
-      throw new Error("Use joytoken.messages.stream() for streaming responses.");
-    }
-
-    return this.requestJSON<MessageResponse>(
-      `${this.anthropicBaseUrl}/messages`,
-      {
-        method: "POST",
-        headers: { "anthropic-version": this.anthropicVersion },
-        body: JSON.stringify({ ...request, stream: false }),
-      },
-      "x-api-key",
-    );
-  }
-
-  private async *streamMessage(request: MessageStreamRequest): AsyncIterable<MessageStreamEvent> {
-    this.requireAutoModel(request.model);
-    this.requireAPIKey();
-    const activeRequest = await this.requestRaw(
-      `${this.anthropicBaseUrl}/messages`,
-      {
-        method: "POST",
-        headers: { Accept: "text/event-stream", "anthropic-version": this.anthropicVersion },
-        body: JSON.stringify({ ...request, stream: true }),
-      },
-      "x-api-key",
-    );
-
-    try {
-      yield* readSSE<MessageStreamEvent>(activeRequest.response);
-    } finally {
-      activeRequest.cleanup();
-    }
   }
 
   private async listModels(options: ListModelsOptions): Promise<ModelListResponse> {
@@ -263,6 +713,154 @@ export class JoyTokenClient {
     }
   }
 
+  private toolSet(tools: Tool[]): { byName: Map<string, Tool>; order: Tool[] } {
+    const byName = new Map<string, Tool>();
+    const order: Tool[] = [];
+    const add = (tool: Tool): void => {
+      if (!tool.name || byName.has(tool.name)) return;
+      byName.set(tool.name, tool);
+      order.push(tool);
+    };
+    for (const tool of tools) add(tool);
+    return { byName, order };
+  }
+
+  private defaultToolSet(): { byName: Map<string, Tool>; order: Tool[] } {
+    const defaults: Tool[] = [];
+    const add = (tool: Tool): void => {
+      if (!this.excludedDefaultTools.has(tool.name)) defaults.push(tool);
+    };
+    if (this.defaultLocalTools) {
+      add(calculator());
+      add(dateTime());
+      const sandbox = { root: this.fileWorkspace };
+      add(fileSearch(sandbox));
+      add(listDir(sandbox));
+      add(fileRead(sandbox));
+      add(gateFileWrite(fileWrite(sandbox), absRoot(sandbox), this.filePermission));
+      const shellSandbox = { workingDir: this.shellWorkspace };
+      add(gateShell(shell(shellSandbox), absWorkingDir(shellSandbox), this.shellPermission));
+    }
+    return this.toolSet(defaults);
+  }
+
+  private chatToolPlan(requestTools: ChatTool[] | undefined): ToolPlan<ChatWireTool> {
+    return this.toolPlan(
+      requestTools,
+      requestTools,
+      requestTools?.map((tool) => tool.function?.name).filter((name): name is string => Boolean(name)),
+    );
+  }
+
+  private responseToolPlan(requestTools: ResponseTool[] | undefined): ToolPlan<ResponseTool> {
+    const registered = this.toolSet(this.registeredTools);
+    if (requestTools !== undefined) {
+      assertHostedFileSearchTools(requestTools);
+      const names = new Set(
+        requestTools
+          .filter((tool) => tool.type === "function")
+          .map((tool) => (typeof tool.name === "string" ? tool.name : ""))
+          .filter(Boolean),
+      );
+      return {
+        declarations: [...requestTools],
+        executables: new Map([...registered.byName].filter(([name]) => names.has(name))),
+        automatic: false,
+      };
+    }
+    if (this.registeredTools.length > 0) {
+      return {
+        declarations: this.registeredTools.map(toResponseTool),
+        executables: registered.byName,
+        automatic: false,
+      };
+    }
+    const defaults = this.defaultToolSet();
+    const declarations: ResponseTool[] = defaults.order.map(toResponseTool);
+    if (this.defaultBuiltinTools && !this.excludedDefaultTools.has("web_search_preview")) {
+      declarations.push({ type: "web_search_preview" });
+    }
+    return {
+      declarations: declarations.length > 0 ? declarations : undefined,
+      executables: defaults.byName,
+      automatic: defaults.order.length > 0,
+    };
+  }
+
+  private messageToolPlan(requestTools: MessageTool[] | undefined): ToolPlan<ChatWireTool> {
+    return this.toolPlan(requestTools, requestTools?.map(messageToolToChat), requestTools?.map((tool) => tool.name));
+  }
+
+  private toolPlan<T, TDeclaration extends ChatWireTool>(
+    requestTools: T[] | undefined,
+    requestDeclarations: TDeclaration[] | undefined,
+    requestNames: string[] | undefined,
+  ): ToolPlan<ChatWireTool> {
+    const registered = this.toolSet(this.registeredTools);
+    if (requestTools !== undefined) {
+      const names = new Set(requestNames ?? []);
+      const executables = new Map(
+        [...registered.byName].filter(([name, tool]) => names.has(name) && typeof tool.execute === "function"),
+      );
+      return { declarations: requestDeclarations ?? [], executables, automatic: false };
+    }
+    if (this.registeredTools.length > 0) {
+      return {
+        declarations: this.registeredTools.map(toChatTool),
+        executables: registered.byName,
+        automatic: false,
+      };
+    }
+    const defaults = this.defaultToolSet();
+    return {
+      declarations: defaults.order.length ? defaults.order.map(toChatTool) : undefined,
+      executables: defaults.byName,
+      automatic: defaults.order.length > 0,
+    };
+  }
+
+  private async runTool(
+    executables: Map<string, Tool>,
+    step: number,
+    toolCall: ToolCall,
+    messages: ChatMessage[],
+  ): Promise<ToolCallResult> {
+    const name = toolCall.function?.name ?? "";
+    const tool = executables.get(name);
+    if (!tool || typeof tool.execute !== "function") {
+      return {
+        tool_call_id: toolCall.id,
+        tool_name: name,
+        content: JSON.stringify({
+          error: {
+            type: "tool_handler_not_found",
+            tool: name,
+            message: `Tool handler not found: ${name}`,
+          },
+        }),
+        is_error: true,
+      };
+    }
+
+    const input = parseToolArguments(toolCall.function?.arguments ?? "");
+    const context: ToolExecutionContext = { step, toolCall, messages };
+    const { output, error } = await safeExecuteTool(tool.execute, input, context);
+    if (error) {
+      return {
+        tool_call_id: toolCall.id,
+        tool_name: name,
+        content: JSON.stringify({ error: { type: "tool_execution_error", tool: name, message: error.message } }),
+        is_error: true,
+      };
+    }
+    return {
+      tool_call_id: toolCall.id,
+      tool_name: name,
+      content: stringifyToolResult(output),
+      is_error: false,
+    };
+  }
+
   private async requestJSON<T>(url: string, init: RequestInit, auth: "bearer" | "x-api-key" = "bearer"): Promise<T> {
     const activeRequest = await this.requestRaw(url, init, auth);
     try {
@@ -277,30 +875,54 @@ export class JoyTokenClient {
     init: RequestInit,
     auth: "bearer" | "x-api-key" = "bearer",
   ): Promise<ActiveRequest> {
-    const controller = this.timeoutMs !== undefined && this.timeoutMs > 0 ? new AbortController() : undefined;
-    const timeout = controller ? setTimeout(() => controller.abort(), this.timeoutMs) : undefined;
-    let cleanedUp = false;
-    const cleanup = () => {
-      if (cleanedUp) return;
-      cleanedUp = true;
-      if (timeout) clearTimeout(timeout);
-    };
+    for (let attempt = 0; ; attempt++) {
+      const controller = this.timeoutMs !== undefined && this.timeoutMs > 0 ? new AbortController() : undefined;
+      const timeout = controller ? setTimeout(() => controller.abort(), this.timeoutMs) : undefined;
+      let cleanedUp = false;
+      const cleanup = () => {
+        if (cleanedUp) return;
+ cleanedUp = true;
+        if (timeout) clearTimeout(timeout);
+      };
 
-    try {
-      const response = await this.fetcher(url, {
-        ...init,
-        signal: init.signal ?? controller?.signal,
-        headers: this.headers(init.headers, auth),
-      });
+      try {
+        const response = await this.fetcher(url, {
+          ...init,
+          signal: init.signal ?? controller?.signal,
+          headers: this.headers(init.headers, auth),
+        });
 
-      if (!response.ok) {
-        throw await buildAPIError(response);
+        if (!response.ok) {
+          // Retry transient server / rate-limit responses before surfacing them.
+          if (attempt < this.maxRetries && isRetryableStatus(response.status)) {
+            const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+            // Drain the body so the connection can be reused.
+            await response.text().catch(() => undefined);
+            cleanup();
+            await sleep(backoffDelay(attempt, retryAfter), init.signal);
+            continue;
+          }
+          throw await buildAPIError(response);
+        }
+
+        return { response, cleanup };
+      } catch (error) {
+        cleanup();
+        // An external abort (caller signal) or timeout is not retried.
+        if (init.signal?.aborted) {
+          throw error;
+        }
+        // JoyTokenAPIError already means a non-retryable response reached here.
+        if (error instanceof JoyTokenAPIError) {
+          throw error;
+        }
+        // Otherwise it is a network/transport error: retry if budget remains.
+        if (attempt < this.maxRetries) {
+          await sleep(backoffDelay(attempt, 0), init.signal);
+          continue;
+        }
+        throw error;
       }
-
-      return { response, cleanup };
-    } catch (error) {
-      cleanup();
-      throw error;
     }
   }
 
@@ -332,10 +954,95 @@ export class JoyTokenClient {
   }
 }
 
+function chatContentText(content: ChatMessage["content"] | unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => (typeof part === "object" && part !== null && "text" in part ? String(part.text ?? "") : ""))
+    .join("");
+}
+
+function emptyChatResponse(): ChatCompletionResponse {
+  return {
+    choices: [{ index: 0, message: { role: "assistant", content: null }, finish_reason: "length" }],
+  };
+}
+
+function normalizeResponseInput(input: ResponseRequest["input"]): ResponseInputItem[] {
+  if (typeof input === "string") {
+    return input === "" ? [] : [{ type: "message", role: "user", content: input }];
+  }
+  return input.map((item) => ({ ...item }));
+}
+
+function responseOutputToInput(item: ResponseOutputItem): ResponseInputItem {
+  return { ...item } as ResponseInputItem;
+}
+
+function responseFunctionCalls(response: JoyTokenResponse): ResponseOutputItem[] {
+  return (response.output ?? []).filter((item) => item.type === "function_call");
+}
+
+function responseOutputText(response: JoyTokenResponse): string {
+  let text = "";
+  for (const item of response.output ?? []) {
+    for (const part of item.content ?? []) {
+      if (part.type === "output_text" && typeof part.text === "string") text += part.text;
+    }
+  }
+  return text;
+}
+
+function withResponseOutputText(response: JoyTokenResponse): JoyTokenResponse {
+  return response.output_text === undefined ? { ...response, output_text: responseOutputText(response) } : response;
+}
+
+function assertHostedFileSearchTools(tools: ResponseTool[]): void {
+  for (const tool of tools) {
+    if (tool.type !== "file_search") continue;
+    if (!Array.isArray(tool.vector_store_ids) || tool.vector_store_ids.length === 0) {
+      throw new Error("Responses hosted file_search requires a non-empty vector_store_ids array.");
+    }
+  }
+}
+
+function responseInputToContextMessages(input: ResponseInputItem[], instructions?: string): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  if (instructions) messages.push({ role: "system", content: instructions });
+  for (const item of input) {
+    if (item.type === "function_call") {
+      const call: ToolCall = {
+        id: item.call_id ?? item.id ?? "",
+        type: "function",
+        function: { name: item.name ?? "", arguments: item.arguments ?? "" },
+      };
+      const previous = messages.at(-1);
+      if (previous?.role === "assistant" && previous.tool_calls) previous.tool_calls.push(call);
+      else messages.push({ role: "assistant", content: null, tool_calls: [call] });
+      continue;
+    }
+    if (item.type === "function_call_output") {
+      messages.push({ role: "tool", tool_call_id: item.call_id ?? "", content: item.output ?? "" });
+      continue;
+    }
+    if (["reasoning", "web_search_call", "file_search_call"].includes(item.type ?? "")) continue;
+    const role = item.role === "assistant" || item.role === "system" || item.role === "developer" ? item.role : "user";
+    messages.push({ role, content: responseInputContentText(item.content) });
+  }
+  return messages;
+}
+
+function responseInputContentText(content: ResponseInputItem["content"]): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => String(part.text ?? "")).join("");
+}
+
 async function* readSSE<T>(response: Response): AsyncIterable<T> {
   if (!response.body) {
     throw new JoyTokenAPIError("JoyToken streaming response did not include a body", {
       status: response.status,
+      code: classifyStatus(response.status),
       responseHeaders: response.headers,
       body: undefined,
       requestId: extractRequestId(response.headers),
@@ -413,6 +1120,7 @@ async function buildAPIError(response: Response): Promise<JoyTokenAPIError> {
 
   return new JoyTokenAPIError(message, {
     status: response.status,
+    code: classifyStatus(response.status),
     responseHeaders: response.headers,
     body,
     requestId: extractRequestId(response.headers),
@@ -423,6 +1131,67 @@ function extractRequestId(headers: Headers): string | undefined {
   return headers.get("x-request-id") ?? headers.get("x-daoe-request-id") ?? undefined;
 }
 
+/** Retry on rate-limit (429) and server/gateway errors (5xx); 4xx are deterministic. */
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+/** Parses a Retry-After header (seconds or HTTP date). Returns 0 when absent/unparseable. */
+function parseRetryAfter(value: string | null): number {
+  if (!value) return 0;
+  const trimmed = value.trim();
+  const secs = Number(trimmed);
+  if (Number.isInteger(secs) && secs >= 0) {
+    return secs * 1000;
+  }
+  const date = Date.parse(trimmed);
+  if (!Number.isNaN(date)) {
+    const delta = date - Date.now();
+    return delta > 0 ? delta : 0;
+  }
+  return 0;
+}
+
+/**
+ * Computes the backoff delay (ms) for the given 0-based attempt. Prefers an
+ * explicit Retry-After when provided, otherwise exponential backoff
+ * (RETRY_BASE_DELAY_MS * 2^attempt) capped at RETRY_MAX_DELAY_MS with full jitter.
+ */
+function backoffDelay(attempt: number, retryAfterMs: number): number {
+  if (retryAfterMs > 0) {
+    return Math.min(retryAfterMs, RETRY_MAX_DELAY_MS);
+  }
+  const backoff = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, RETRY_MAX_DELAY_MS);
+  return Math.floor(Math.random() * (backoff + 1));
+}
+
+/** Sleeps for the given ms, aborting early (and rejecting) if the signal fires. */
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error("aborted"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error("aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+function deriveOpenAIBaseUrl(value: string): string {
+  let base = trimTrailingSlash(value);
+  base = base.replace(/\/openai\/v1\/(?:chat\/completions|responses|images\/generations)$/i, "/openai/v1");
+  base = base.replace(/\/anthropic\/v1(?:\/messages)?$/i, "");
+  base = base.replace(/(?:\/openai\/v1){2,}$/i, "/openai/v1");
+  return /\/openai\/v1$/i.test(base) ? base : `${base}/openai/v1`;
 }

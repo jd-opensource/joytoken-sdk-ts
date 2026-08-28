@@ -15,6 +15,7 @@ import type { ModelProvider, ModelRequest, ModelResponse } from "./types.js";
 export type JoyTokenProtocol = "openai" | "anthropic";
 
 export interface JoyTokenProviderOptions extends JoyTokenClientOptions {
+  /** Selects the public response shape. Both protocols use the same Chat Completions Gateway endpoint. */
   protocol?: JoyTokenProtocol;
 }
 
@@ -24,10 +25,7 @@ export function createJoyTokenProvider(options: JoyTokenProviderOptions = {}): M
 
   return {
     async complete(request: ModelRequest): Promise<ModelResponse> {
-      if (protocol === "anthropic") {
-        return completeAnthropic(client, request);
-      }
-
+      if (protocol === "anthropic") return completeAnthropic(client, request);
       const payload: ChatCompletionRequest = {
         model: "auto",
         messages: request.messages,
@@ -54,9 +52,7 @@ export function createJoyTokenProvider(options: JoyTokenProviderOptions = {}): M
 }
 
 async function completeAnthropic(client: JoyTokenClient, request: ModelRequest): Promise<ModelResponse> {
-  const converted = toAnthropicRequest(request);
-  const response = await client.messages.create(converted);
-
+  const response = await client.messages.create(toAnthropicRequest(request));
   return {
     message: normalizeAnthropicMessage(response),
     usage: normalizeAnthropicUsage(response),
@@ -69,45 +65,40 @@ function toAnthropicRequest(request: ModelRequest): MessageRequest {
   const messages: MessageParam[] = [];
 
   for (const message of request.messages) {
-    if (message.role === "system") {
+    if (message.role === "system" || message.role === "developer") {
       const text = textFromContent(message.content);
       if (text) systemBlocks.push(text);
       continue;
     }
-
     if (message.role === "tool") {
-      const toolResult: MessageContentBlock = {
-        type: "tool_result",
-        tool_use_id: message.tool_call_id ?? "unknown",
-        content: textFromContent(message.content),
-      };
-      appendAnthropicMessage(messages, { role: "user", content: [toolResult] });
+      appendAnthropicMessage(messages, {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: message.tool_call_id ?? "", content: textFromContent(message.content) }],
+      });
       continue;
     }
-
     if (message.role === "assistant" && message.tool_calls?.length) {
       const content: MessageContentBlock[] = [];
       const text = textFromContent(message.content);
       if (text) content.push({ type: "text", text });
       content.push(
-        ...message.tool_calls.map((toolCall) => ({
+        ...message.tool_calls.map((call) => ({
           type: "tool_use",
-          id: toolCall.id,
-          name: toolCall.function.name,
-          input: parseToolInput(toolCall.function.arguments),
+          id: call.id,
+          name: call.function.name,
+          input: parseObject(call.function.arguments),
         })),
       );
       appendAnthropicMessage(messages, { role: "assistant", content });
       continue;
     }
-
     appendAnthropicMessage(messages, {
       role: message.role === "assistant" ? "assistant" : "user",
-      content: contentForAnthropic(message.content),
+      content: typeof message.content === "string" ? message.content : textFromContent(message.content),
     });
   }
 
-  const payload: MessageRequest = {
+  return {
     model: "auto",
     max_tokens: request.maxTokens ?? 1024,
     messages,
@@ -117,41 +108,14 @@ function toAnthropicRequest(request: ModelRequest): MessageRequest {
     tier: request.tier,
     metadata: request.metadata,
   };
-
-  return payload;
 }
 
 function appendAnthropicMessage(messages: MessageParam[], message: MessageParam): void {
   const previous = messages[messages.length - 1];
   if (previous?.role === message.role && Array.isArray(previous.content) && Array.isArray(message.content)) {
     previous.content.push(...message.content);
-    return;
-  }
-  messages.push(message);
-}
-
-function contentForAnthropic(content: ChatMessage["content"]): string | MessageContentBlock[] {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) return content as MessageContentBlock[];
-  return "";
-}
-
-function textFromContent(content: ChatMessage["content"]): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((part) => part.type === "text" || typeof part.text === "string")
-    .map((part) => String(part.text ?? ""))
-    .join("");
-}
-
-function parseToolInput(argumentsText: string): Record<string, unknown> {
-  if (!argumentsText) return {};
-  try {
-    const parsed: unknown = JSON.parse(argumentsText);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    return {};
+  } else {
+    messages.push(message);
   }
 }
 
@@ -165,38 +129,42 @@ function toAnthropicTool(tool: NonNullable<ModelRequest["tools"]>[number]): Mess
 
 function normalizeAnthropicMessage(response: MessageResponse): ChatMessage {
   const text = response.content
-    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .filter((block) => block.type === "text")
     .map((block) => block.text ?? "")
     .join("");
   const toolCalls = response.content
     .filter((block) => block.type === "tool_use" && block.id && block.name)
     .map((block) => ({
-      id: block.id as string,
+      id: block.id!,
       type: "function" as const,
-      function: {
-        name: block.name as string,
-        arguments: JSON.stringify(block.input ?? {}),
-      },
+      function: { name: block.name!, arguments: JSON.stringify(block.input ?? {}) },
     }));
-
-  return {
-    role: "assistant",
-    content: text || null,
-    ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-  };
+  return { role: "assistant", content: text || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
 }
 
 function normalizeAnthropicUsage(response: MessageResponse): Usage {
-  const promptTokens = response.usage?.input_tokens;
-  const completionTokens = response.usage?.output_tokens;
+  const prompt = response.usage.input_tokens;
+  const completion = response.usage.output_tokens;
   return {
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    total_tokens:
-      promptTokens === undefined && completionTokens === undefined
-        ? undefined
-        : (promptTokens ?? 0) + (completionTokens ?? 0),
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt === undefined && completion === undefined ? undefined : (prompt ?? 0) + (completion ?? 0),
   };
+}
+
+function textFromContent(content: ChatMessage["content"]): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => ("text" in part ? String(part.text ?? "") : "")).join("");
+}
+
+function parseObject(value: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = value ? JSON.parse(value) : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 function normalizeMessage(message: ChatMessage): ChatMessage {
