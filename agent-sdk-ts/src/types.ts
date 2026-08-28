@@ -71,6 +71,12 @@ export interface ToolResult {
   toolCallId: string;
   toolName: string;
   content: string;
+  /**
+   * True when the tool did not produce a normal result. On failure `content`
+   * carries the error message so it can be fed back to the model, letting the
+   * run continue and self-correct instead of aborting.
+   */
+  isError?: boolean;
 }
 
 export interface UsageSummary {

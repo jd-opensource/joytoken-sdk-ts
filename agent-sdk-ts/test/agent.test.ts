@@ -99,6 +99,67 @@ test("keeps the run-level maxSteps cap with custom stop conditions", async () =>
   assert.equal(result.stoppedBy, "step_count:2");
 });
 
+test("feeds a tool error back to the model instead of aborting the run", async () => {
+  let step = 0;
+  const provider: ModelProvider = {
+    async complete() {
+      step += 1;
+      if (step === 1) {
+        return {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "call_1", type: "function", function: { name: "boom", arguments: "{}" } }],
+          },
+        };
+      }
+      return { message: { role: "assistant", content: "recovered" } };
+    },
+  };
+
+  const agent = new Agent({
+    model: provider,
+    stopWhen: [stepCountIs(4)],
+    tools: [
+      defineTool({
+        name: "boom",
+        execute: () => {
+          throw new Error("kaboom");
+        },
+      }),
+    ],
+  });
+
+  const result = await agent.run("go");
+  assert.equal(result.finalText, "recovered");
+  assert.equal(result.steps[0]?.toolResults[0]?.isError, true);
+  assert.match(result.steps[0]?.toolResults[0]?.content ?? "", /Tool error: kaboom/);
+});
+
+test("marks an unknown tool call as an error observation", async () => {
+  let step = 0;
+  const provider: ModelProvider = {
+    async complete() {
+      step += 1;
+      if (step === 1) {
+        return {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "call_1", type: "function", function: { name: "ghost", arguments: "{}" } }],
+          },
+        };
+      }
+      return { message: { role: "assistant", content: "done" } };
+    },
+  };
+
+  const agent = new Agent({ model: provider, stopWhen: [stepCountIs(4)] });
+  const result = await agent.run("go");
+  assert.equal(result.steps[0]?.toolResults[0]?.isError, true);
+  assert.match(result.steps[0]?.toolResults[0]?.content ?? "", /Tool not found: ghost/);
+});
+
 test("preserves an explicit zero cost in usage", async () => {
   const agent = new Agent({
     model: {

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+!client-sdk-ts/dist/
+!client-sdk-ts/dist/**
+!agent-sdk-ts/dist/
+!agent-sdk-ts/dist/**
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+*.test

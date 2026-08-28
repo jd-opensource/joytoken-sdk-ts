@@ -1,4 +1,7 @@
-export type ChatRole = "system" | "user" | "assistant" | "tool";
+import type { Tool } from "./tools.js";
+import type { FilePermissionFunc } from "./file-permission.js";
+import type { ShellPermissionFunc } from "./shell-permission.js";
+export type ChatRole = "system" | "developer" | "user" | "assistant" | "tool";
 /** The only model value accepted by JoyToken requests. */
 export type JoyTokenModel = "auto";
 export interface ChatMessage {
@@ -16,6 +19,19 @@ export interface ToolCall {
         name: string;
         arguments: string;
     };
+}
+/** Serialized outcome of one SDK-managed tool invocation. */
+export interface ToolCallResult {
+    tool_call_id: string;
+    tool_name: string;
+    content: string;
+    is_error: boolean;
+}
+export interface ToolRunStreamOptions {
+    /** Receives only model text deltas, never tool argument fragments. */
+    onTextDelta?: (delta: string) => void;
+    /** Receives each local tool result after its handler finishes. */
+    onToolResult?: (result: ToolCallResult) => void;
 }
 export interface ChatTool {
     type: "function";
@@ -81,23 +97,51 @@ export interface ChatCompletionChunk {
     [key: string]: unknown;
 }
 export interface ResponseInputContentPart {
-    type: "input_text" | "output_text" | "text";
-    text: string;
+    type: "input_text" | "output_text" | "text" | string;
+    text?: string;
     [key: string]: unknown;
 }
 export interface ResponseInputItem {
-    type?: "message" | string;
+    type?: "message" | "function_call" | "function_call_output" | string;
     role?: ChatRole;
     content?: string | ResponseInputContentPart[];
+    call_id?: string;
+    id?: string;
+    name?: string;
+    arguments?: string;
+    output?: string;
+    status?: string;
+    summary?: unknown[];
+    encrypted_content?: string;
     [key: string]: unknown;
 }
-export interface ResponseTool {
-    type: "function" | string;
+export interface ResponseFunctionTool {
+    type: "function";
     name: string;
     description?: string;
     parameters?: Record<string, unknown>;
+    strict?: boolean;
     [key: string]: unknown;
 }
+export interface ResponseHostedTool {
+    type: string;
+    [key: string]: unknown;
+}
+export interface ResponseHostedFileSearchTool extends ResponseHostedTool {
+    type: "file_search";
+    vector_store_ids: string[];
+}
+export interface ResponseHostedWebSearchTool extends ResponseHostedTool {
+    type: "web_search_preview";
+}
+export type ResponseTool = ResponseFunctionTool | ResponseHostedTool;
+export type ResponseToolChoice = "none" | "auto" | "required" | {
+    type: "function";
+    name: string;
+} | {
+    type: string;
+    [key: string]: unknown;
+};
 export interface ResponseRequest {
     model: JoyTokenModel;
     input: string | ResponseInputItem[];
@@ -107,10 +151,34 @@ export interface ResponseRequest {
     temperature?: number;
     top_p?: number;
     tools?: ResponseTool[];
+    tool_choice?: ResponseToolChoice;
+    parallel_tool_calls?: boolean;
+    previous_response_id?: string;
+    include?: string[];
+    store?: boolean;
+    tier?: string;
+    service_tier?: string;
+    metadata?: Record<string, unknown>;
     [key: string]: unknown;
 }
-export interface ResponseStreamRequest extends Omit<ResponseRequest, "stream"> {
+export interface ResponseStreamRequest {
+    model: JoyTokenModel;
+    input: string | ResponseInputItem[];
+    instructions?: string;
     stream: true;
+    max_output_tokens?: number;
+    temperature?: number;
+    top_p?: number;
+    tools?: ResponseTool[];
+    tool_choice?: ResponseToolChoice;
+    parallel_tool_calls?: boolean;
+    previous_response_id?: string;
+    include?: string[];
+    store?: boolean;
+    tier?: string;
+    service_tier?: string;
+    metadata?: Record<string, unknown>;
+    [key: string]: unknown;
 }
 export interface ResponseOutputContent {
     type: string;
@@ -124,6 +192,13 @@ export interface ResponseOutputItem {
     role?: string;
     status?: string;
     content?: ResponseOutputContent[];
+    name?: string;
+    arguments?: string;
+    call_id?: string;
+    summary?: unknown[];
+    encrypted_content?: string;
+    action?: Record<string, unknown>;
+    results?: unknown[];
     [key: string]: unknown;
 }
 export interface ResponseUsage {
@@ -135,11 +210,15 @@ export interface ResponseUsage {
 export interface Response {
     id: string;
     object: "response" | string;
+    created_at?: number;
     status: string;
     model: string;
     output?: ResponseOutputItem[];
+    output_text?: string;
     usage?: ResponseUsage;
     metadata?: Record<string, unknown>;
+    error?: Record<string, unknown> | null;
+    incomplete_details?: Record<string, unknown> | null;
     [key: string]: unknown;
 }
 export interface ResponseStreamEvent {
@@ -153,6 +232,102 @@ export interface ResponseStreamEvent {
     part?: ResponseOutputContent;
     delta?: string;
     text?: string;
+    arguments?: string;
+    error?: Record<string, unknown>;
+    [key: string]: unknown;
+}
+export interface MessageContentBlock {
+    type: string;
+    text?: string;
+    id?: string;
+    name?: string;
+    input?: Record<string, unknown>;
+    tool_use_id?: string;
+    content?: string | MessageContentBlock[];
+    is_error?: boolean;
+    [key: string]: unknown;
+}
+export interface MessageParam {
+    role: "user" | "assistant";
+    content: string | MessageContentBlock[];
+}
+export interface MessageTool {
+    name: string;
+    description?: string;
+    input_schema: Record<string, unknown>;
+    [key: string]: unknown;
+}
+export type MessageToolChoice = {
+    type: "auto";
+    disable_parallel_tool_use?: boolean;
+} | {
+    type: "any";
+    disable_parallel_tool_use?: boolean;
+} | {
+    type: "tool";
+    name: string;
+    disable_parallel_tool_use?: boolean;
+} | {
+    type: "none";
+};
+export interface MessageRequest {
+    model: JoyTokenModel;
+    max_tokens: number;
+    messages: MessageParam[];
+    system?: string | MessageContentBlock[];
+    stream?: false;
+    temperature?: number;
+    top_p?: number;
+    stop_sequences?: string[];
+    tools?: MessageTool[];
+    tool_choice?: MessageToolChoice;
+    tier?: string;
+    metadata?: Record<string, unknown>;
+    [key: string]: unknown;
+}
+export interface MessageStreamRequest {
+    model: JoyTokenModel;
+    max_tokens: number;
+    messages: MessageParam[];
+    system?: string | MessageContentBlock[];
+    stream: true;
+    temperature?: number;
+    top_p?: number;
+    stop_sequences?: string[];
+    tools?: MessageTool[];
+    tool_choice?: MessageToolChoice;
+    tier?: string;
+    metadata?: Record<string, unknown>;
+    [key: string]: unknown;
+}
+export interface MessageUsage {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+    [key: string]: unknown;
+}
+export interface MessageResponse {
+    id: string;
+    type: "message";
+    role: "assistant";
+    content: MessageContentBlock[];
+    model: string;
+    stop_reason?: string | null;
+    stop_sequence?: string | null;
+    usage: MessageUsage;
+    metadata?: Record<string, unknown>;
+    [key: string]: unknown;
+}
+export interface MessageStreamEvent {
+    type: string;
+    index?: number;
+    message?: MessageResponse;
+    content_block?: MessageContentBlock;
+    delta?: Record<string, unknown>;
+    usage?: MessageUsage;
+    error?: Record<string, unknown>;
+    metadata?: Record<string, unknown>;
     [key: string]: unknown;
 }
 export interface ImageGenerationRequest {
@@ -266,76 +441,82 @@ export interface PricingResponse {
     data: Pricing;
     message: string;
 }
-export interface MessageContentBlock {
-    type: string;
-    text?: string;
-    id?: string;
-    name?: string;
-    input?: Record<string, unknown>;
-    [key: string]: unknown;
-}
-export interface MessageParam {
-    role: "user" | "assistant";
-    content: string | MessageContentBlock[];
-}
-export interface MessageTool {
-    name: string;
-    description?: string;
-    input_schema: Record<string, unknown>;
-}
-export interface MessageRequest {
-    model: JoyTokenModel;
-    max_tokens: number;
-    messages: MessageParam[];
-    system?: string | MessageContentBlock[];
-    stream?: false;
-    temperature?: number;
-    tools?: MessageTool[];
-    tier?: string;
-    metadata?: Record<string, unknown>;
-    [key: string]: unknown;
-}
-export interface MessageStreamRequest extends Omit<MessageRequest, "stream"> {
-    stream: true;
-}
-export interface MessageUsage {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_creation_input_tokens?: number;
-    cache_read_input_tokens?: number;
-    [key: string]: unknown;
-}
-export interface MessageResponse {
-    id: string;
-    type: "message";
-    role: "assistant";
-    content: MessageContentBlock[];
-    model: string;
-    stop_reason?: string | null;
-    stop_sequence?: string | null;
-    usage: MessageUsage;
-    metadata?: Record<string, unknown>;
-    [key: string]: unknown;
-}
-export interface MessageStreamEvent {
-    type: string;
-    index?: number;
-    message?: MessageResponse;
-    content_block?: MessageContentBlock;
-    delta?: Record<string, unknown>;
-    usage?: MessageUsage;
-    error?: Record<string, unknown>;
-    metadata?: Record<string, unknown>;
-    [key: string]: unknown;
-}
 export interface JoyTokenClientOptions {
     apiKey?: string;
     apiBaseUrl?: string;
     openAIBaseUrl?: string;
+    /** @deprecated Kept for source compatibility. Messages always use the Chat Completions endpoint. */
     anthropicBaseUrl?: string;
+    /** @deprecated Kept for source compatibility. Messages are adapted locally and use Bearer auth. */
     anthropicVersion?: string;
     fetch?: typeof fetch;
     defaultHeaders?: Record<string, string>;
     timeoutMs?: number;
+    /**
+     * Maximum number of automatic retries for transient failures (HTTP 429 and
+     * 5xx, plus network/transport errors). Defaults to 2 (3 attempts total).
+     * Set to 0 to disable retries. Retries use exponential backoff with full
+     * jitter and honor the `Retry-After` response header.
+     */
+    maxRetries?: number;
+    /**
+     * Tools registered on the client. They are used only when request.tools is
+     * undefined, and are executed only through an explicit run/executeTools API.
+     */
+    tools?: Tool[];
+    /**
+     * When true (default), the built-in local tools are used only when neither
+     * request tools nor Client-registered tools exist: calculator, datetime, and the read-only file tools
+     * (file_search, list_dir, file_read) scoped to fileWorkspace. The
+     * side-effecting file_write and shell tools are always declared too, but each
+     * invocation is gated: without a matching permission callback (filePermission
+     * / shellPermission) the declaration is still sent yet execution is refused,
+     * so the model sees the capability but nothing runs without host approval.
+     */
+    defaultLocalTools?: boolean;
+    /**
+     * Opts Responses into hosted default tools. Disabled by default. Currently
+     * this only adds web_search_preview; hosted file_search is never synthesized
+     * because vector_store_ids must come from the caller.
+     */
+    defaultBuiltinTools?: boolean;
+    /**
+     * Maximum number of tool-calling iterations for the non-streaming loop.
+     * Defaults to 8.
+     */
+    toolMaxSteps?: number;
+    /**
+     * Root directory the default file tools are sandboxed to. Empty/undefined
+     * falls back to the current working directory. Applies to file_read,
+     * list_dir, file_search, and file_write.
+     */
+    fileWorkspace?: string;
+    /**
+     * Host approval callback for file writes. The side-effecting file_write tool
+     * is always declared to the model; configuring this callback is what lets its
+     * writes actually run. Every write is gated through it and fails safe: with
+     * no callback, file_write is declared but refused at execution time. Read-only
+     * file tools (file_read/list_dir/file_search) run without approval.
+     */
+    filePermission?: FilePermissionFunc;
+    /**
+     * Root directory the default shell tool runs commands in. Empty/undefined
+     * falls back to the current working directory, matching fileWorkspace.
+     */
+    shellWorkspace?: string;
+    /**
+     * Host approval callback for shell commands. The side-effecting shell tool is
+     * always declared to the model; configuring this callback is what lets its
+     * commands actually run. Every invocation is gated through it and fails safe:
+     * with no callback, shell is declared but refused at execution time, so the
+     * model sees the capability yet nothing runs without host approval.
+     */
+    shellPermission?: ShellPermissionFunc;
+    /**
+     * Names of default tools to exclude from the injected set, e.g.
+     * ["shell", "file_write"]. Matched by tool name. It does not affect tools the
+     * caller registers explicitly via `tools`.
+     */
+    excludedDefaultTools?: string[];
 }
 //# sourceMappingURL=types.d.ts.map

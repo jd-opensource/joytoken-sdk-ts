@@ -14,12 +14,7 @@ before(async () => {
       return;
     }
 
-    const isAnthropic = req.url === "/anthropic/v1/messages";
-    const validAuth = isAnthropic
-      ? req.headers["x-api-key"] === "test-key" &&
-        req.headers["anthropic-version"] === "2023-06-01" &&
-        req.headers.authorization === undefined
-      : req.headers.authorization === "Bearer test-key";
+    const validAuth = req.headers.authorization === "Bearer test-key";
     if (!validAuth) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: { message: "missing api key" } }));
@@ -91,29 +86,6 @@ before(async () => {
       return;
     }
 
-    if (req.method === "POST" && req.url === "/openai/v1/responses") {
-      const body = await readBody(req);
-      const payload = JSON.parse(body) as { stream?: boolean };
-      if (payload.stream) {
-        res.writeHead(200, { "Content-Type": "text/event-stream" });
-        res.write('event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test","object":"response","status":"in_progress","model":"auto"}}\n\n');
-        res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":1,"delta":"hello"}\n\n');
-        res.write('event: response.completed\ndata: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_test","object":"response","status":"completed","model":"auto","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}\n\n');
-        res.end();
-        return;
-      }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        id: "resp_test",
-        object: "response",
-        status: "completed",
-        model: "auto",
-        output: [{ type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "hello" }] }],
-        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-      }));
-      return;
-    }
-
     if (req.method === "POST" && req.url === "/openai/v1/images/generations") {
       const body = await readBody(req);
       const payload = JSON.parse(body) as { model?: string; prompt?: string; size?: string };
@@ -126,35 +98,6 @@ before(async () => {
         data: [{ url: "https://example.com/generated.png", revised_prompt: payload.prompt }],
         metadata: { usage: { credits_used: "1.25" } },
       }));
-      return;
-    }
-
-    if (req.method === "POST" && req.url === "/anthropic/v1/messages") {
-      const body = await readBody(req);
-      const payload = JSON.parse(body) as { stream?: boolean };
-
-      if (payload.stream) {
-        res.writeHead(200, { "Content-Type": "text/event-stream" });
-        res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"auto","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n');
-        res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n');
-        res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
-        res.end();
-        return;
-      }
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          id: "msg_test",
-          type: "message",
-          role: "assistant",
-          content: [{ type: "text", text: "hello" }],
-          model: "auto",
-          stop_reason: "end_turn",
-          stop_sequence: null,
-          usage: { input_tokens: 1, output_tokens: 1 },
-        }),
-      );
       return;
     }
 
@@ -196,31 +139,6 @@ test("streams chat completions", async () => {
   assert.equal(chunks[0]?.choices[0]?.delta.content, "hello");
 });
 
-test("creates Responses", async () => {
-  const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
-  const response = await client.responses.create({
-    model: "auto",
-    input: "hello",
-    instructions: "Be concise",
-    max_output_tokens: 128,
-  });
-
-  assert.equal(response.output?.[0]?.content?.[0]?.text, "hello");
-  assert.equal(response.usage?.input_tokens, 1);
-});
-
-test("streams Responses events", async () => {
-  const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
-  const events = [];
-  for await (const event of client.responses.stream({ model: "auto", input: "hello" })) {
-    events.push(event);
-  }
-
-  assert.deepEqual(events.map((event) => event.type), ["response.created", "response.output_text.delta", "response.completed"]);
-  assert.equal(events[1]?.delta, "hello");
-  assert.equal(events[2]?.response?.status, "completed");
-});
-
 test("generates images", async () => {
   const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl, openAIBaseUrl: `${baseUrl}/openai/v1` });
   const response = await client.images.generate({
@@ -231,32 +149,6 @@ test("generates images", async () => {
 
   assert.equal(response.data[0]?.url, "https://example.com/generated.png");
   assert.deepEqual(response.metadata?.usage, { credits_used: "1.25" });
-});
-
-test("creates Anthropic messages", async () => {
-  const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl });
-  const response = await client.messages.create({
-    model: "auto",
-    max_tokens: 128,
-    messages: [{ role: "user", content: "hello" }],
-  });
-
-  assert.equal(response.content[0]?.text, "hello");
-});
-
-test("streams Anthropic messages", async () => {
-  const client = new JoyTokenClient({ apiKey: "test-key", apiBaseUrl: baseUrl });
-  const events = [];
-  for await (const event of client.messages.stream({
-    model: "auto",
-    max_tokens: 128,
-    messages: [{ role: "user", content: "hello" }],
-  })) {
-    events.push(event);
-  }
-
-  assert.deepEqual(events.map((event) => event.type), ["message_start", "content_block_delta", "message_stop"]);
-  assert.equal(events[1]?.delta?.text, "hello");
 });
 
 test("lists models", async () => {
@@ -279,11 +171,7 @@ test("rejects concrete model IDs before sending a request", async () => {
   const calls = [
     () => client.chat.completions.create({ model: concreteModel, messages: [] }),
     () => client.chat.completions.stream({ model: concreteModel, messages: [] })[Symbol.asyncIterator]().next(),
-    () => client.responses.create({ model: concreteModel, input: "hello" }),
-    () => client.responses.stream({ model: concreteModel, input: "hello" })[Symbol.asyncIterator]().next(),
     () => client.images.generate({ model: concreteModel, prompt: "hello" }),
-    () => client.messages.create({ model: concreteModel, max_tokens: 16, messages: [] }),
-    () => client.messages.stream({ model: concreteModel, max_tokens: 16, messages: [] })[Symbol.asyncIterator]().next(),
   ];
 
   for (const call of calls) {
@@ -363,12 +251,7 @@ test("rejects authenticated requests locally when the API key is missing", async
 
   const expected = /JoyToken API key is required/;
   await assert.rejects(() => client.chat.completions.create({ model: "auto", messages: [] }), expected);
-  await assert.rejects(() => client.responses.create({ model: "auto", input: "hello" }), expected);
   await assert.rejects(() => client.images.generate({ model: "auto", prompt: "hello" }), expected);
-  await assert.rejects(
-    () => client.messages.create({ model: "auto", max_tokens: 16, messages: [] }),
-    expected,
-  );
   await assert.rejects(() => client.models.meta(), expected);
   await assert.rejects(() => client.pricing.retrieve(), expected);
   assert.equal(requestCount, 0);
@@ -403,32 +286,17 @@ test("keeps SDK authentication and request headers authoritative", async () => {
     defaultHeaders: {
       Authorization: "Bearer custom",
       "x-api-key": "custom-key",
-      "anthropic-version": "custom-version",
     },
-    fetch: async (input, init) => {
+    fetch: async (_input, init) => {
       observed.push(new Headers(init?.headers));
-      if (String(input).includes("/anthropic/")) {
-        return Response.json({
-          id: "msg_test",
-          type: "message",
-          role: "assistant",
-          content: [{ type: "text", text: "hello" }],
-          model: "auto",
-          usage: { input_tokens: 1, output_tokens: 1 },
-        });
-      }
       return Response.json({ choices: [{ message: { role: "assistant", content: "hello" } }] });
     },
   });
 
   await client.chat.completions.create({ model: "auto", messages: [] });
-  await client.messages.create({ model: "auto", max_tokens: 16, messages: [] });
 
   assert.equal(observed[0]?.get("Authorization"), "Bearer test-key");
   assert.equal(observed[0]?.has("x-api-key"), false);
-  assert.equal(observed[1]?.has("Authorization"), false);
-  assert.equal(observed[1]?.get("x-api-key"), "test-key");
-  assert.equal(observed[1]?.get("anthropic-version"), "2023-06-01");
 });
 
 test("parses a final SSE event without a trailing newline", async () => {

@@ -76,12 +76,11 @@ node index.mjs
 
 ## Supported APIs
 
-The SDKs intentionally cover only the currently public JoyToken developer API:
+The Gateway has one base URL and two public OpenAI protocol endpoints. Anthropic Messages is the SDK-side compatibility adapter over Chat Completions:
 
 - `POST /openai/v1/chat/completions`
 - `POST /openai/v1/responses`
 - `POST /openai/v1/images/generations`
-- `POST /anthropic/v1/messages`
 - `GET /api/v1/models`
 - `GET /api/v1/models/meta`
 - `GET /api/v1/pricing`
@@ -90,7 +89,7 @@ Embeddings and public management APIs are not exposed here until the gateway pub
 
 ## Configuration
 
-The default endpoint is `https://api.joytokens.ai`. Requests time out after 60 seconds by default; pass `timeoutMs: 0` to disable that limit. Use `JOY_TOKEN_API_BASE_URL`, `JOY_TOKEN_OPENAI_BASE_URL`, or `JOY_TOKEN_ANTHROPIC_BASE_URL` to target another environment.
+The default endpoint is `https://api.joytokens.ai`. Requests time out after 60 seconds by default; pass `timeoutMs: 0` to disable that limit. Use `JOY_TOKEN_API_BASE_URL` or the legacy `JOY_TOKEN_OPENAI_BASE_URL` to target another environment. The legacy Anthropic base option is retained for source compatibility but never selects a separate model route.
 
 Authenticated model calls, model metadata and pricing requests fail locally with a clear error when no API key is configured. `models.list()` remains the unauthenticated catalog call.
 

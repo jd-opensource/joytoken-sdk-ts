@@ -76,12 +76,11 @@ node index.mjs
 
 ## 支持的 API
 
-SDK 目前仅覆盖已经公开的 JoyToken 开发者 API：
+Gateway 只有一个 Base URL，并正式提供两个 OpenAI 协议入口；Anthropic Messages 由 SDK 在本地适配到 Chat Completions：
 
 - `POST /openai/v1/chat/completions`
 - `POST /openai/v1/responses`
 - `POST /openai/v1/images/generations`
-- `POST /anthropic/v1/messages`
 - `GET /api/v1/models`
 - `GET /api/v1/models/meta`
 - `GET /api/v1/pricing`
@@ -90,7 +89,7 @@ SDK 目前仅覆盖已经公开的 JoyToken 开发者 API：
 
 ## 配置
 
-默认服务地址为 `https://api.joytokens.ai`。请求默认超时时间为 60 秒；传入 `timeoutMs: 0` 可禁用该限制。如需使用其他环境，可以设置 `JOY_TOKEN_API_BASE_URL`、`JOY_TOKEN_OPENAI_BASE_URL` 或 `JOY_TOKEN_ANTHROPIC_BASE_URL`。
+默认服务地址为 `https://api.joytokens.ai`。请求默认超时时间为 60 秒；传入 `timeoutMs: 0` 可禁用该限制。如需使用其他环境，可以设置 `JOY_TOKEN_API_BASE_URL` 或兼容保留的 `JOY_TOKEN_OPENAI_BASE_URL`。Anthropic 专用 Base URL 仅为源码兼容保留，不会选择独立模型接口。
 
 调用需要鉴权的模型接口、模型元数据和价格接口时，如果未配置 API Key，SDK 会在发送网络请求前直接给出明确错误。只有 `models.list()` 是无需鉴权的模型目录接口。
 

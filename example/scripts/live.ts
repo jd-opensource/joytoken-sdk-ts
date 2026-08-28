@@ -27,9 +27,15 @@ if (models.data.models[0]) {
   console.log(`First model: ${models.data.models[0].alias}`);
 }
 
+const chatNonce = Date.now();
 const completion = await client.chat.completions.create({
   model: "auto",
-  messages: [{ role: "user", content: "Reply with one short sentence confirming JoyToken is connected." }],
+  messages: [
+    {
+      role: "user",
+      content: `Reply with one short sentence confirming JoyToken is connected. (probe nonce ${chatNonce}, ignore this number)`,
+    },
+  ],
   max_tokens: 80,
 });
 
@@ -47,7 +53,10 @@ const agent = new Agent({
   maxTokens: 80,
 });
 
-const result = await agent.run("Confirm the Agent SDK can call JoyToken through the configured provider.");
+const nonce = Date.now();
+const result = await agent.run(
+  `Confirm the Agent SDK can call JoyToken through the configured provider. (probe nonce ${nonce}, ignore this number)`,
+);
 
 console.log("\nAgent SDK response:");
 console.log(result.finalText);
