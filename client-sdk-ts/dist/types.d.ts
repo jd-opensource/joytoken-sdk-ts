@@ -19,6 +19,8 @@ export interface ToolCall {
         name: string;
         arguments: string;
     };
+    /** Opaque provider extension data that must be replayed unchanged on tool continuations. */
+    extra_content?: Record<string, unknown>;
 }
 /** Serialized outcome of one SDK-managed tool invocation. */
 export interface ToolCallResult {
@@ -113,6 +115,8 @@ export interface ResponseInputItem {
     status?: string;
     summary?: unknown[];
     encrypted_content?: string;
+    /** Opaque provider extension data associated with this input item. */
+    extra_content?: Record<string, unknown>;
     [key: string]: unknown;
 }
 export interface ResponseFunctionTool {
@@ -199,6 +203,8 @@ export interface ResponseOutputItem {
     encrypted_content?: string;
     action?: Record<string, unknown>;
     results?: unknown[];
+    /** Opaque provider extension data associated with this output item. */
+    extra_content?: Record<string, unknown>;
     [key: string]: unknown;
 }
 export interface ResponseUsage {
@@ -245,6 +251,8 @@ export interface MessageContentBlock {
     tool_use_id?: string;
     content?: string | MessageContentBlock[];
     is_error?: boolean;
+    /** Opaque provider extension data associated with this content block. */
+    extra_content?: Record<string, unknown>;
     [key: string]: unknown;
 }
 export interface MessageParam {
@@ -456,9 +464,10 @@ export interface JoyTokenClientOptions {
     timeoutMs?: number;
     /**
      * Maximum number of automatic retries for transient failures (HTTP 429 and
-     * 5xx, plus network/transport errors). Defaults to 2 (3 attempts total).
-     * Set to 0 to disable retries. Retries use exponential backoff with full
-     * jitter and honor the `Retry-After` response header.
+     * 5xx, plus network/transport errors). Defaults to 0 because model requests
+     * are not inherently idempotent. Set a positive value to opt in. Retries use
+     * exponential backoff with full jitter and honor the `Retry-After` response
+     * header.
      */
     maxRetries?: number;
     /**

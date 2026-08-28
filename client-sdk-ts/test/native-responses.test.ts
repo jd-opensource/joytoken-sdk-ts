@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  JoyTokenAPIError,
   JoyTokenClient,
   defineTool,
   type Response as JoyTokenResponse,
@@ -19,6 +20,7 @@ function response(options: {
   toolName?: string;
   callId?: string;
   arguments?: string;
+  extraContent?: Record<string, unknown>;
   output?: ResponseOutputItem[];
 } = {}): JoyTokenResponse {
   const output = options.output ?? (options.toolName
@@ -29,6 +31,7 @@ function response(options: {
         call_id: options.callId ?? "call_1",
         name: options.toolName,
         arguments: options.arguments ?? "{}",
+        ...(options.extraContent === undefined ? {} : { extra_content: options.extraContent }),
       }]
     : [{
         id: `msg_${options.id ?? "resp_1"}`,
@@ -47,6 +50,11 @@ function response(options: {
     metadata: { routed: true },
   };
 }
+
+const opaqueExtraContent = {
+  google: { thought_signature: "opaque-signature", provider_flag: "keep-me" },
+  future_vendor: { nested: { token: "vendor-token" }, values: [1, 2, 3] },
+};
 
 function mockClient(
   replies: Array<JoyTokenResponse | Response>,
@@ -141,6 +149,81 @@ test("native Responses run keeps effectiveTools and request options on every tur
   assert.equal(result.output_text, "done");
 });
 
+test("native Responses run preserves opaque function_call metadata in replay and execution context", async () => {
+  let executions = 0;
+  let executionExtraContent: unknown;
+  const echo = defineTool({
+    name: "echo",
+    execute: (_input, context) => {
+      executions += 1;
+      executionExtraContent = context.toolCall.extra_content;
+      return "echoed";
+    },
+  });
+  const { client, requests } = mockClient([
+    response({ toolName: "echo", arguments: '{"text":"hello"}', extraContent: opaqueExtraContent }),
+    response({ id: "final-extra", text: "done" }),
+  ], { tools: [echo] });
+
+  await client.responses.run({ model: "auto", input: "echo" });
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
+  assert.deepEqual(executionExtraContent, opaqueExtraContent);
+  assert.deepEqual(requests[1]?.body.input.at(-2)?.extra_content, opaqueExtraContent);
+  assert.equal(requests[1]?.body.tools.length, 1);
+  assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
+});
+
+test("native Responses run reports the failed continuation without retrying the tool", async () => {
+  let executions = 0;
+  const echo = defineTool({ name: "echo", execute: () => { executions += 1; return "echoed"; } });
+  const failureBody = { error: { code: "provider_error", message: "continuation rejected" } };
+  const failure = new Response(JSON.stringify(failureBody), {
+    status: 503,
+    headers: { "Content-Type": "application/json", "x-request-id": "req_responses_continuation" },
+  });
+  const { client, requests } = mockClient([
+    response({ toolName: "echo", extraContent: opaqueExtraContent }),
+    failure,
+  ], { tools: [echo] });
+
+  await assert.rejects(
+    () => client.responses.run({ model: "auto", input: "echo" }),
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.equal(error.status, 503);
+      assert.equal(error.requestId, "req_responses_continuation");
+      assert.deepEqual(error.body, failureBody);
+      assert.deepEqual(error.context, {
+        protocol: "responses",
+        phase: "tool_continuation",
+        requestNumber: 2,
+        toolStep: 1,
+        toolCalls: [{ id: "call_1", name: "echo", hasExtraContent: true }],
+      });
+      return true;
+    },
+  );
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
+  assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
+});
+
+test("native Responses calls without extra_content do not emit an empty extension object", async () => {
+  const echo = defineTool({ name: "echo", execute: () => "echoed" });
+  const { client, requests } = mockClient([
+    response({ toolName: "echo" }),
+    response({ text: "done" }),
+  ], { tools: [echo] });
+
+  await client.responses.run({ model: "auto", input: "echo" });
+
+  const replayedCall = requests[1]?.body.input.at(-2);
+  assert.equal("extra_content" in replayedCall, false);
+});
+
 test("native Responses previous_response_id continuation avoids history replay", async () => {
   const echo = defineTool({ name: "echo", execute: () => "echoed" });
   const { client, requests } = mockClient([
@@ -196,6 +279,72 @@ test("native Responses runStream aggregates terminal responses and reports text/
   assert.deepEqual(results, ["echoed"]);
   assert.equal(result.id, "final");
   assert.equal(result.output_text, "done");
+});
+
+test("native Responses runStream keeps output_item.done opaque metadata on the continuation", async () => {
+  let executions = 0;
+  let executionExtraContent: unknown;
+  const first = response({ toolName: "echo", arguments: '{"text":"hi"}', extraContent: opaqueExtraContent });
+  const terminalWithoutOutput = { ...first, output: [] };
+  const final = response({ id: "stream-final-extra", text: "done" });
+  const firstSSE = new Response(
+    `data: {"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":${JSON.stringify(first.output?.[0])}}\n\ndata: {"type":"response.completed","sequence_number":1,"response":${JSON.stringify(terminalWithoutOutput)}}\n\ndata: [DONE]\n\n`,
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+  const finalSSE = new Response(
+    `data: {"type":"response.completed","sequence_number":0,"response":${JSON.stringify(final)}}\n\ndata: [DONE]\n\n`,
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+  const echo = defineTool({
+    name: "echo",
+    execute: (_input, context) => {
+      executions += 1;
+      executionExtraContent = context.toolCall.extra_content;
+      return "echoed";
+    },
+  });
+  const { client, requests } = mockClient([firstSSE, finalSSE], { tools: [echo] });
+
+  await client.responses.runStream({ model: "auto", input: "echo" });
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
+  assert.deepEqual(executionExtraContent, opaqueExtraContent);
+  assert.deepEqual(requests[1]?.body.input.at(-2)?.extra_content, opaqueExtraContent);
+  assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
+});
+
+test("native Responses runStream annotates a failed continuation and executes once", async () => {
+  let executions = 0;
+  const first = response({ toolName: "echo", callId: "call_stream_error" });
+  const firstSSE = new Response(
+    `data: {"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":${JSON.stringify(first.output?.[0])}}\n\ndata: {"type":"response.completed","sequence_number":1,"response":${JSON.stringify(first)}}\n\ndata: [DONE]\n\n`,
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+  const failure = new Response(JSON.stringify({ error: { message: "continuation rejected" } }), {
+    status: 400,
+    headers: { "Content-Type": "application/json" },
+  });
+  const echo = defineTool({ name: "echo", execute: () => { executions += 1; return "echoed"; } });
+  const { client, requests } = mockClient([firstSSE, failure], { tools: [echo] });
+
+  await assert.rejects(
+    () => client.responses.runStream({ model: "auto", input: "echo" }),
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.deepEqual(error.context, {
+        protocol: "responses",
+        phase: "tool_continuation",
+        requestNumber: 2,
+        toolStep: 1,
+        toolCalls: [{ id: "call_stream_error", name: "echo", hasExtraContent: false }],
+      });
+      return true;
+    },
+  );
+
+  assert.equal(requests.length, 2);
+  assert.equal(executions, 1);
 });
 
 test("native Responses run always submits executed outputs before exhausting toolMaxSteps", async () => {

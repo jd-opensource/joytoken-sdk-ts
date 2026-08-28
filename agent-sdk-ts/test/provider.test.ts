@@ -6,6 +6,7 @@ import { createJoyTokenProvider } from "../src/index.js";
 let baseUrl = "";
 let closeServer: undefined | (() => Promise<void>);
 let lastRequest: { url: string; headers: Record<string, string | string[] | undefined>; body: Record<string, unknown> } | undefined;
+let nextChatResponse: Record<string, unknown> | undefined;
 
 before(async () => {
   const server = createServer(async (req, res) => {
@@ -15,7 +16,11 @@ before(async () => {
     if (req.url === "/openai/v1/chat/completions") {
       assert.equal(req.headers.authorization, "Bearer test-key");
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "hello" } }], usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } }));
+      res.end(JSON.stringify(nextChatResponse ?? {
+        choices: [{ message: { role: "assistant", content: "hello" } }],
+        usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+      }));
+      nextChatResponse = undefined;
       return;
     }
 
@@ -70,6 +75,55 @@ test("Anthropic provider compatibility still uses the single Chat Completions ro
   });
   assert.equal(response.message.content, "hello");
   assert.equal(response.usage?.total_tokens, 5);
+});
+
+test("Anthropic provider preserves opaque tool metadata in request and response conversions", async () => {
+  const extraContent = {
+    google: { thought_signature: "opaque-signature" },
+    future_vendor: { nested: { token: "vendor-token" } },
+  };
+  nextChatResponse = {
+    choices: [{
+      message: {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: "call_response",
+          type: "function",
+          function: { name: "echo", arguments: '{"text":"response"}' },
+          extra_content: extraContent,
+        }],
+      },
+      finish_reason: "tool_calls",
+    }],
+    usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+  };
+  const provider = createJoyTokenProvider({
+    apiKey: "test-key",
+    apiBaseUrl: baseUrl,
+    protocol: "anthropic",
+  });
+  const response = await provider.complete({
+    messages: [
+      { role: "user", content: "echo" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: "call_request",
+          type: "function",
+          function: { name: "echo", arguments: '{"text":"request"}' },
+          extra_content: extraContent,
+        }],
+      },
+      { role: "tool", tool_call_id: "call_request", content: "request" },
+    ],
+    tools: [{ type: "function", function: { name: "echo", parameters: { type: "object" } } }],
+  });
+
+  const requestMessages = lastRequest?.body.messages as Array<Record<string, any>>;
+  assert.deepEqual(requestMessages[1]?.tool_calls[0]?.extra_content, extraContent);
+  assert.deepEqual(response.message.tool_calls?.[0]?.extra_content, extraContent);
 });
 
 function readBody(req: NodeJS.ReadableStream): Promise<string> {

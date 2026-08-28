@@ -1,17 +1,40 @@
 import type { ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamRequest, ImageGenerationRequest, ImageGenerationResponse, JoyTokenClientOptions, ListModelsOptions, MessageRequest, MessageResponse, MessageStreamEvent, ModelListResponse, ModelMetadataResponse, PricingResponse, Response as JoyTokenResponse, ResponseRequest, ResponseStreamEvent, ToolRunStreamOptions } from "./types.js";
 export type ErrorCode = "rate_limited" | "server_error" | "timeout" | "network" | "invalid_request" | "authentication" | "permission" | "not_found" | "unknown";
+export type JoyTokenProtocol = "chat" | "responses" | "messages";
+export interface JoyTokenToolCallDiagnostic {
+    readonly id: string;
+    readonly name: string;
+    /** Whether the Gateway supplied opaque provider metadata for this call. */
+    readonly hasExtraContent: boolean;
+}
+/**
+ * Read-only execution context attached to HTTP errors from model requests.
+ * It describes where the failure occurred without changing or retrying the
+ * request, and deliberately excludes tool arguments and results.
+ */
+export interface JoyTokenErrorContext {
+    readonly protocol: JoyTokenProtocol;
+    readonly phase: "initial_request" | "tool_continuation" | "repair_continuation";
+    /** One-based model request number within the public SDK call. */
+    readonly requestNumber: number;
+    /** One-based tool step whose results were submitted by this continuation. */
+    readonly toolStep?: number;
+    readonly toolCalls?: readonly JoyTokenToolCallDiagnostic[];
+}
 export declare class JoyTokenAPIError extends Error {
     readonly status: number;
     readonly code: ErrorCode;
     readonly requestId?: string;
     readonly responseHeaders: Headers;
     readonly body: unknown;
+    readonly context?: JoyTokenErrorContext;
     constructor(message: string, options: {
         status: number;
         code: ErrorCode;
         responseHeaders: Headers;
         body: unknown;
         requestId?: string;
+        context?: JoyTokenErrorContext;
     });
 }
 export declare class JoyTokenClient {

@@ -39,6 +39,8 @@ console.log(result.finalText);
 
 JoyToken Agent SDK always sends `model: "auto"`; model IDs cannot be selected through the Agent SDK. Tool execution, state, and approval logic remain in your application.
 
+Agent tool loops retain the complete provider-returned `ToolCall`, including opaque `extra_content` fields such as Gemini thought signatures, for both handler context and the next model turn. Provider adapters do not interpret or synthesize these extension fields.
+
 Every run has a hard eight-step limit by default. Set `maxSteps` per run or add `stopWhen` conditions for tool-call or cost budgets, and handle provider and tool errors in your application.
 
 ```ts

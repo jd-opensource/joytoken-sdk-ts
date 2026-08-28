@@ -1,3 +1,4 @@
+import { mergeOpaqueObject } from "./opaque.js";
 export function messageToolToChat(tool) {
     return {
         type: "function",
@@ -41,6 +42,7 @@ export function chatResponseToMessage(response) {
             id: call.id,
             name: call.function.name,
             input: parseObject(call.function.arguments),
+            ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
         });
     }
     const metadata = anthropicMetadata(response.metadata, response.usage);
@@ -139,6 +141,7 @@ export async function* chatStreamToMessages(chunks) {
                 const partial = typeof fn.arguments === "string" ? fn.arguments : "";
                 if (partial)
                     call.arguments += partial;
+                call.extra_content = mergeOpaqueObject(call.extra_content, raw.extra_content);
             }
         }
     }
@@ -150,7 +153,13 @@ export async function* chatStreamToMessages(chunks) {
         yield {
             type: "content_block_start",
             index: call.block,
-            content_block: { type: "tool_use", id: call.id, name: call.name, input: {} },
+            content_block: {
+                type: "tool_use",
+                id: call.id,
+                name: call.name,
+                input: {},
+                ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
+            },
         };
         if (call.arguments) {
             yield {
@@ -189,6 +198,7 @@ function appendAnthropicInput(messages, role, content) {
             id: block.id ?? "",
             type: "function",
             function: { name: block.name ?? "", arguments: JSON.stringify(block.input ?? {}) },
+            ...(block.extra_content === undefined ? {} : { extra_content: block.extra_content }),
         }));
         messages.push({ role: "assistant", content: text || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
         return;

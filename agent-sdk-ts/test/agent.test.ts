@@ -50,6 +50,55 @@ test("runs an agent loop with a tool call", async () => {
   assert.equal(result.usage.cost, 0.03);
 });
 
+test("agent loop preserves the complete opaque ToolCall for execution and continuation", async () => {
+  const extraContent = {
+    google: { thought_signature: "opaque-signature" },
+    future_vendor: { nested: { token: "vendor-token" } },
+  };
+  let providerCalls = 0;
+  let executedExtraContent: unknown;
+  const provider: ModelProvider = {
+    async complete({ messages, tools }) {
+      providerCalls += 1;
+      assert.equal(tools?.length, 1);
+      if (providerCalls === 1) {
+        return {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: "call_opaque",
+              type: "function",
+              function: { name: "echo", arguments: '{"text":"hello"}' },
+              extra_content: extraContent,
+            }],
+          },
+        };
+      }
+      const assistant = messages.find((message) => message.role === "assistant" && message.tool_calls?.length);
+      assert.deepEqual(assistant?.tool_calls?.[0]?.extra_content, extraContent);
+      assert.equal(messages.filter((message) => message.role === "tool").length, 1);
+      return { message: { role: "assistant", content: "done" } };
+    },
+  };
+  const agent = new Agent({
+    model: provider,
+    tools: [defineTool({
+      name: "echo",
+      execute: (_input, context) => {
+        executedExtraContent = context.toolCall.extra_content;
+        return "echoed";
+      },
+    })],
+  });
+
+  const result = await agent.run("echo");
+
+  assert.equal(providerCalls, 2);
+  assert.deepEqual(executedExtraContent, extraContent);
+  assert.deepEqual(result.steps[0]?.assistantMessage.tool_calls?.[0]?.extra_content, extraContent);
+});
+
 test("stops when a configured condition is reached", async () => {
   const provider: ModelProvider = {
     async complete() {
