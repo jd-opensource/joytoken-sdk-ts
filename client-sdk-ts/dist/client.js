@@ -320,7 +320,9 @@ export class JoyTokenClient {
             }),
         });
         try {
-            yield* readSSE(activeRequest.response);
+            for await (const event of readSSE(activeRequest.response)) {
+                yield normalizeChatCompletionChunk(event);
+            }
         }
         finally {
             activeRequest.cleanup();
@@ -811,6 +813,28 @@ function responseInputContentText(content) {
         return "";
     return content.map((part) => String(part.text ?? "")).join("");
 }
+/**
+ * The Gateway may interleave metadata-only or usage-only SSE events with Chat
+ * delta events. Keep every field from the wire while honoring the public
+ * ChatCompletionChunk contract: choices is always an array and every exposed
+ * choice has a delta object.
+ */
+function normalizeChatCompletionChunk(value) {
+    if (!isRecord(value)) {
+        throw new TypeError("JoyToken Chat streaming event must be a JSON object");
+    }
+    const rawChoices = Array.isArray(value.choices) ? value.choices : [];
+    const choices = rawChoices.flatMap((rawChoice, fallbackIndex) => {
+        if (!isRecord(rawChoice))
+            return [];
+        return [{
+                ...rawChoice,
+                index: typeof rawChoice.index === "number" ? rawChoice.index : fallbackIndex,
+                delta: isRecord(rawChoice.delta) ? rawChoice.delta : {},
+            }];
+    });
+    return { ...value, choices };
+}
 async function* readSSE(response) {
     if (!response.body) {
         throw new JoyTokenAPIError("JoyToken streaming response did not include a body", {
@@ -878,6 +902,9 @@ function parseSSEEvent(dataLines) {
     if (data === "[DONE]")
         return STREAM_DONE;
     return JSON.parse(data);
+}
+function isRecord(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 async function buildAPIError(response) {
     const text = await response.text();

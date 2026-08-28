@@ -43,6 +43,7 @@ export function chatResponseToMessage(response) {
             input: parseObject(call.function.arguments),
         });
     }
+    const metadata = anthropicMetadata(response.metadata, response.usage);
     return {
         id: response.id ?? "",
         type: "message",
@@ -52,13 +53,14 @@ export function chatResponseToMessage(response) {
         stop_reason: anthropicStopReason(choice?.finish_reason, content),
         stop_sequence: null,
         usage: anthropicUsage(response.usage),
-        ...(isRecord(response.metadata) ? { metadata: response.metadata } : {}),
+        ...(metadata === undefined ? {} : { metadata }),
     };
 }
 export async function* chatStreamToMessages(chunks) {
     let id = "";
     let model = "auto";
     let usage;
+    let metadata = {};
     let finishReason;
     let started = false;
     let nextBlock = 0;
@@ -70,6 +72,14 @@ export async function* chatStreamToMessages(chunks) {
         id = chunk.id ?? id;
         model = chunk.model ?? model;
         usage = chunk.usage ?? usage;
+        if (isRecord(chunk.metadata))
+            metadata = { ...metadata, ...chunk.metadata };
+        const hasMessageData = chunk.id !== undefined ||
+            chunk.model !== undefined ||
+            chunk.usage !== undefined ||
+            (Array.isArray(chunk.choices) && chunk.choices.length > 0);
+        if (!started && !hasMessageData)
+            continue;
         if (!started) {
             started = true;
             yield {
@@ -83,6 +93,7 @@ export async function* chatStreamToMessages(chunks) {
                     stop_reason: null,
                     stop_sequence: null,
                     usage: { input_tokens: usage?.prompt_tokens ?? 0, output_tokens: 0 },
+                    ...(Object.keys(metadata).length > 0 ? { metadata: { ...metadata } } : {}),
                 },
             };
         }
@@ -156,10 +167,12 @@ export async function* chatStreamToMessages(chunks) {
         yield { type: "content_block_delta", index, delta: { type: "text_delta", text: deferredText } };
         yield { type: "content_block_stop", index };
     }
+    const finalMetadata = anthropicMetadata(metadata, usage);
     yield {
         type: "message_delta",
         delta: { stop_reason: anthropicStopReason(finishReason, callBlocks.size ? [{ type: "tool_use" }] : []) },
-        usage: { input_tokens: usage?.prompt_tokens, output_tokens: usage?.completion_tokens },
+        usage: anthropicUsage(usage),
+        ...(finalMetadata === undefined ? {} : { metadata: finalMetadata }),
     };
     yield { type: "message_stop" };
 }
@@ -241,10 +254,24 @@ function blockText(value) {
 function anthropicUsage(usage) {
     const details = usage?.prompt_tokens_details;
     return {
-        input_tokens: usage?.prompt_tokens,
-        output_tokens: usage?.completion_tokens,
+        input_tokens: usage?.prompt_tokens ?? 0,
+        output_tokens: usage?.completion_tokens ?? 0,
         ...(details?.cached_tokens === undefined ? {} : { cache_read_input_tokens: details.cached_tokens }),
     };
+}
+function anthropicMetadata(value, usage) {
+    const metadata = isRecord(value) ? { ...value } : {};
+    if (!hasCompleteTokenUsage(usage)) {
+        metadata.joytoken = {
+            ...(isRecord(metadata.joytoken) ? metadata.joytoken : {}),
+            usage_status: "unavailable",
+            usage_source: "gateway",
+        };
+    }
+    return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+function hasCompleteTokenUsage(usage) {
+    return typeof usage?.prompt_tokens === "number" && typeof usage.completion_tokens === "number";
 }
 function anthropicStopReason(reason, content) {
     if (content.some((block) => block.type === "tool_use") || reason === "tool_calls" || reason === "function_call")

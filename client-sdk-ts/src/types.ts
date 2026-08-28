@@ -328,8 +328,10 @@ export interface MessageStreamRequest {
 }
 
 export interface MessageUsage {
-  input_tokens?: number;
-  output_tokens?: number;
+  /** Zero when the Gateway omits usage; inspect metadata.joytoken.usage_status. */
+  input_tokens: number;
+  /** Zero when the Gateway omits usage; inspect metadata.joytoken.usage_status. */
+  output_tokens: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
   [key: string]: unknown;

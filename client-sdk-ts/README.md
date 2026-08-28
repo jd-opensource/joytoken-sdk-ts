@@ -92,9 +92,22 @@ for await (const chunk of joytoken.chat.completions.stream({
   model: "auto",
   messages: [{ role: "user", content: "Say hello" }],
 })) {
-  process.stdout.write(String(chunk.choices[0]?.delta.content ?? ""));
+  const content = chunk.choices?.[0]?.delta?.content;
+  if (content) process.stdout.write(String(content));
 }
 ```
+
+Chat streams may contain metadata-only or usage-only SSE events. The SDK preserves
+those fields and normalizes `chunk.choices` to `[]`, so every emitted
+`ChatCompletionChunk` matches its TypeScript contract. Consumers should still
+read deltas defensively as shown above because not every event carries text.
+
+When the Gateway omits token usage, Chat and Responses keep `usage` absent rather
+than inventing billing data. Anthropic Messages requires numeric token fields, so
+the compatibility adapter returns zeroes and sets
+`metadata.joytoken.usage_status` to `"unavailable"`; those zeroes are compatibility
+values, not measured usage. HTTP and provider errors, including upstream 503s,
+are always surfaced as `JoyTokenAPIError` and are never converted into success.
 
 ```ts
 for await (const event of joytoken.responses.stream({

@@ -475,7 +475,9 @@ export class JoyTokenClient {
     });
 
     try {
-      yield* readSSE<ChatCompletionChunk>(activeRequest.response);
+      for await (const event of readSSE<unknown>(activeRequest.response)) {
+        yield normalizeChatCompletionChunk(event);
+      }
     } finally {
       activeRequest.cleanup();
     }
@@ -1038,6 +1040,30 @@ function responseInputContentText(content: ResponseInputItem["content"]): string
   return content.map((part) => String(part.text ?? "")).join("");
 }
 
+/**
+ * The Gateway may interleave metadata-only or usage-only SSE events with Chat
+ * delta events. Keep every field from the wire while honoring the public
+ * ChatCompletionChunk contract: choices is always an array and every exposed
+ * choice has a delta object.
+ */
+function normalizeChatCompletionChunk(value: unknown): ChatCompletionChunk {
+  if (!isRecord(value)) {
+    throw new TypeError("JoyToken Chat streaming event must be a JSON object");
+  }
+
+  const rawChoices = Array.isArray(value.choices) ? value.choices : [];
+  const choices = rawChoices.flatMap((rawChoice, fallbackIndex) => {
+    if (!isRecord(rawChoice)) return [];
+    return [{
+      ...rawChoice,
+      index: typeof rawChoice.index === "number" ? rawChoice.index : fallbackIndex,
+      delta: isRecord(rawChoice.delta) ? rawChoice.delta : {},
+    }];
+  }) as ChatCompletionChunk["choices"];
+
+  return { ...value, choices } as ChatCompletionChunk;
+}
+
 async function* readSSE<T>(response: Response): AsyncIterable<T> {
   if (!response.body) {
     throw new JoyTokenAPIError("JoyToken streaming response did not include a body", {
@@ -1102,6 +1128,10 @@ function parseSSEEvent<T>(dataLines: string[]): T | typeof STREAM_DONE | undefin
   const data = dataLines.join("\n").trim();
   if (data === "[DONE]") return STREAM_DONE;
   return JSON.parse(data) as T;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function buildAPIError(response: Response): Promise<JoyTokenAPIError> {

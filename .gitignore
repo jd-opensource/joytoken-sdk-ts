@@ -11,3 +11,19 @@ coverage/
 .env.*
 !.env.example
 *.test
+
+# Local editor and agent state
+.idea/
+.vscode/
+.joycode/
+.codex/
+.agents/
+
+# Local diagnostics and temporary artifacts
+live-test-logs/
+.cache/
+.turbo/
+tmp/
+temp/
+*.tgz
+*.tsbuildinfo

@@ -449,6 +449,25 @@ test("Anthropic converts requests, tool history, tool_choice, response and usage
   assert.deepEqual(response.usage, { input_tokens: 2, output_tokens: 3 });
 });
 
+test("Anthropic marks Gateway usage as unavailable instead of returning missing token fields", async () => {
+  const withoutUsage = chatResponse({ id: "msg_without_usage", content: "answer" });
+  delete withoutUsage.usage;
+  const { client } = mockClient([withoutUsage]);
+
+  const response = await client.messages.create({
+    model: "auto",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "hello" }],
+    tools: [],
+  });
+
+  assert.deepEqual(response.usage, { input_tokens: 0, output_tokens: 0 });
+  assert.deepEqual(response.metadata?.joytoken, {
+    usage_status: "unavailable",
+    usage_source: "gateway",
+  });
+});
+
 test("Anthropic request tools remain primitive and Client handlers execute only through run", async () => {
   let executions = 0;
   const tool = defineTool({ name: "lookup", execute: () => { executions += 1; return "record"; } });
@@ -604,6 +623,32 @@ test("Anthropic stream emits the standard message lifecycle", async () => {
   assert.equal(events[2]?.delta?.text, "hello");
   assert.equal(events[4]?.delta?.stop_reason, "end_turn");
   assert.equal(events[4]?.usage?.output_tokens, 1);
+});
+
+test("Anthropic stream delays message_start for metadata-only Chat events and marks missing usage", async () => {
+  const sse = new Response(
+    'data: {"metadata":{"request_class":"standard"}}\n\ndata: {"id":"m_metadata","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+  const { client } = mockClient([sse]);
+  const events = [];
+  for await (const event of client.messages.stream({
+    model: "auto",
+    max_tokens: 32,
+    messages: [{ role: "user", content: "hi" }],
+    tools: [],
+  })) events.push(event);
+
+  assert.equal(events[0]?.type, "message_start");
+  assert.equal(events[0]?.message?.id, "m_metadata");
+  assert.equal(events[0]?.message?.model, "m");
+  assert.deepEqual(events[0]?.message?.metadata, { request_class: "standard" });
+  const delta = events.find((event) => event.type === "message_delta");
+  assert.deepEqual(delta?.usage, { input_tokens: 0, output_tokens: 0 });
+  assert.deepEqual(delta?.metadata, {
+    request_class: "standard",
+    joytoken: { usage_status: "unavailable", usage_source: "gateway" },
+  });
 });
 
 test("Anthropic stream converts fragmented Chat tool calls to tool_use JSON deltas", async () => {

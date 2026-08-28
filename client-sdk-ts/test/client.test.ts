@@ -314,6 +314,52 @@ test("parses a final SSE event without a trailing newline", async () => {
   assert.equal(chunks[0]?.choices[0]?.delta.content, "hello");
 });
 
+test("normalizes Chat metadata-only and usage-only SSE events to stable chunks", async () => {
+  const body = [
+    'data: {"metadata":{"request_class":"standard"}}',
+    'data: {"id":"chat_stream","choices":[{"index":0,"delta":{"content":"hello"}}]}',
+    'data: {"id":"chat_stream","choices":[{"index":0}]}',
+    'data: {"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+  const client = new JoyTokenClient({
+    apiKey: "test-key",
+    fetch: async () => new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+  });
+
+  const chunks = [];
+  let text = "";
+  for await (const chunk of client.chat.completions.stream({ model: "auto", messages: [] })) {
+    chunks.push(chunk);
+    text += String(chunk.choices[0]?.delta.content ?? "");
+  }
+
+  assert.equal(chunks.length, 4);
+  assert.deepEqual(chunks[0]?.choices, []);
+  assert.deepEqual(chunks[0]?.metadata, { request_class: "standard" });
+  assert.deepEqual(chunks[2]?.choices[0]?.delta, {});
+  assert.deepEqual(chunks[3]?.choices, []);
+  assert.deepEqual(chunks[3]?.usage, { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 });
+  assert.equal(text, "hello");
+});
+
+test("rejects non-object Chat SSE payloads as protocol errors", async () => {
+  const client = new JoyTokenClient({
+    apiKey: "test-key",
+    fetch: async () => new Response('data: "invalid"\n\ndata: [DONE]\n\n', {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    }),
+  });
+
+  await assert.rejects(async () => {
+    for await (const _chunk of client.chat.completions.stream({ model: "auto", messages: [] })) {
+      // Consume the stream to trigger validation.
+    }
+  }, /Chat streaming event must be a JSON object/);
+});
+
 test("cancels an SSE response when iteration stops early", async () => {
   let cancelled = false;
   const client = new JoyTokenClient({

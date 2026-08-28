@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Normalized Chat streaming metadata-only and usage-only events so every emitted chunk has a stable `choices` array while preserving all Gateway fields.
+- Hardened the Anthropic Messages adapter for missing Gateway usage: required token fields now use explicit compatibility zeroes and carry a `metadata.joytoken.usage_status = "unavailable"` marker.
 - Injected read-only file tools (`file_search`, `list_dir`, `file_read`) into the default local tool set, scoped to `fileWorkspace` (an empty workspace falls back to the current working directory). Behavior change: requests now advertise these tools by default; pass `defaultLocalTools: false` to opt out.
 - Added the side-effecting `file_write` tool, which only joins the default set when a `filePermission` callback is configured and is always routed through a fail-safe host approval gate (a denied or throwing callback blocks the write and leaves disk untouched).
 - Hardened the file sandbox against symlink escapes: path resolution now compares the real (symlink-resolved) path of the deepest existing ancestor against the sandbox root, not just the lexical form.
