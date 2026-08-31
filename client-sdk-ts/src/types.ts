@@ -40,7 +40,52 @@ export interface ToolRunStreamOptions {
   onTextDelta?: (delta: string) => void;
   /** Receives each local tool result after its handler finishes. */
   onToolResult?: (result: ToolCallResult) => void;
+  /**
+   * Receives orchestration progress events (plan announcement and per-sub-task
+   * lifecycle) when the gateway drives an orchestrated turn. Never fires for
+   * non-orchestrated responses.
+   */
+  onOrchestrationEvent?: (event: OrchestrationEvent) => void;
 }
+
+/** Aggregated text produced by a single orchestration sub-task. */
+export interface OrchestrationStage {
+  task_id?: string;
+  task_seq?: number;
+  task_status?: string;
+  title?: string;
+  /** Concatenated text deltas emitted while this sub-task was active. */
+  content: string;
+}
+
+/** Orchestration summary attached to an aggregated chat completion response. */
+export interface OrchestrationResult {
+  /** The announced plan, if the gateway sent a planning chunk. */
+  plan?: OrchestrationPlanItem[];
+  /** Every sub-task observed during the turn, in arrival order. */
+  stages: OrchestrationStage[];
+}
+
+/** A plan announcement, emitted once when the gateway reveals its plan. */
+export interface OrchestrationPlanEvent {
+  type: "plan";
+  plan: OrchestrationPlanItem[];
+  phase?: string;
+}
+
+/** A per-sub-task lifecycle event, emitted as each sub-task streams. */
+export interface OrchestrationStageEvent {
+  type: "stage";
+  task_id?: string;
+  task_seq?: number;
+  task_status?: string;
+  title?: string;
+  /** True when this is the sentinel final-answer sub-task. */
+  final: boolean;
+}
+
+/** Union of orchestration progress events delivered to onOrchestrationEvent. */
+export type OrchestrationEvent = OrchestrationPlanEvent | OrchestrationStageEvent;
 
 export interface ChatTool {
   type: "function";
@@ -93,6 +138,48 @@ export interface ChatCompletionResponse {
   model?: string;
   choices: ChatCompletionChoice[];
   usage?: Usage;
+  /**
+   * Aggregated orchestration result when the turn was produced by an
+   * orchestrating gateway. `stages` preserves every sub-task in arrival order;
+   * `plan` is the announced plan when available.
+   */
+  orchestration?: OrchestrationResult;
+  [key: string]: unknown;
+}
+
+/**
+ * Sentinel task_id the gateway assigns to the orchestration stage that carries
+ * the final, user-facing answer. Non-final stages (search, reasoning, ...)
+ * stream intermediate content that should not be concatenated into the reply.
+ */
+export const ORCHESTRATION_FINAL_TASK_ID = "__final__";
+
+/** One planned orchestration step announced by the gateway before execution. */
+export interface OrchestrationPlanItem {
+  seq: number;
+  task_id: string;
+  title: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Orchestration metadata attached by an orchestrating gateway to each streamed
+ * chunk. It describes which sub-task produced the chunk and, on planning
+ * chunks, the full plan of upcoming sub-tasks.
+ */
+export interface OrchestrationInfo {
+  /** Identifier of the sub-task that produced this chunk (e.g. "search_spots", "__final__"). */
+  task_id?: string;
+  /** 1-based ordinal of the sub-task within the plan. */
+  task_seq?: number;
+  /** Lifecycle status of the sub-task, e.g. "DONE". */
+  task_status?: string;
+  /** Human-readable title of the sub-task. */
+  title?: string;
+  /** Coarse orchestration phase, e.g. "planning". */
+  phase?: string;
+  /** Present on planning chunks: the ordered list of sub-tasks to run. */
+  plan?: OrchestrationPlanItem[];
   [key: string]: unknown;
 }
 
@@ -110,6 +197,8 @@ export interface ChatCompletionChunk {
   model?: string;
   choices: ChatCompletionChunkChoice[];
   usage?: Usage;
+  /** Orchestration metadata when the response is produced by an orchestrating gateway. */
+  orchestration?: OrchestrationInfo;
   [key: string]: unknown;
 }
 

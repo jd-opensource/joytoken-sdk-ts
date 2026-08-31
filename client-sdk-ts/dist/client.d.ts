@@ -145,6 +145,14 @@ export declare class JoyTokenClient {
     private toolPlan;
     private runTool;
     private requestJSON;
+    /**
+     * Non-streaming Chat requests need the same mid-payload error guard as the
+     * streaming path: the Gateway can answer HTTP 200 with an
+     * `{"error":{...},"choices":[]}` envelope (for example a failed orchestration
+     * run). requestJSON alone would surface that as an empty response, so detect
+     * the error envelope on the raw body before returning.
+     */
+    private requestChatCompletionJSON;
     private requestRaw;
     private headers;
 }

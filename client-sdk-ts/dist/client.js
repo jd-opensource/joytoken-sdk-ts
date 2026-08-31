@@ -1,3 +1,4 @@
+import { ORCHESTRATION_FINAL_TASK_ID } from "./types.js";
 import { calculator, dateTime, parseToolArguments, safeExecuteTool, stringifyToolResult, toChatTool, toResponseTool, } from "./tools.js";
 import { chatResponseToMessage, chatStreamToMessages, messageRequestToChat, messageToolToChat, } from "./compat.js";
 import { fileRead, fileWrite, listDir, fileSearch, absRoot } from "./file-tools.js";
@@ -174,7 +175,7 @@ export class JoyTokenClient {
             stream: false,
             ...(declarations === undefined ? {} : { tools: declarations }),
         };
-        return this.requestJSON(this.chatCompletionsUrl, {
+        return this.requestChatCompletionJSON({
             method: "POST",
             body: JSON.stringify(body),
         });
@@ -240,7 +241,7 @@ export class JoyTokenClient {
             const context = step === 0
                 ? requestErrorContext(protocol, "initial_request", 1)
                 : requestErrorContext(protocol, "tool_continuation", step + 1, step, continuationCalls);
-            response = await withAPIErrorContext(context, () => this.collectChatStreamTurn({ ...request, messages, stream: true }, plan.declarations, options.onTextDelta));
+            response = await withAPIErrorContext(context, () => this.collectChatStreamTurn({ ...request, messages, stream: true }, plan.declarations, options.onTextDelta, options.onOrchestrationEvent));
             const message = response.choices[0]?.message;
             if (!message)
                 return response;
@@ -262,7 +263,7 @@ export class JoyTokenClient {
         }
         return response ?? emptyChatResponse();
     }
-    async collectChatStreamTurn(request, declarations, onTextDelta) {
+    async collectChatStreamTurn(request, declarations, onTextDelta, onOrchestrationEvent) {
         let id;
         let object;
         let created;
@@ -271,22 +272,28 @@ export class JoyTokenClient {
         let finishReason;
         let content = "";
         let extraMetadata = {};
+        const orchestration = new OrchestrationAggregator(onOrchestrationEvent);
         const calls = new Map();
         for await (const chunk of this.streamChatCompletionWire(request, declarations)) {
-            const { id: _id, object: _object, created: _created, model: _model, choices: _choices, usage: _usage, ...chunkMetadata } = chunk;
+            const { id: _id, object: _object, created: _created, model: _model, choices: _choices, usage: _usage, orchestration: _orchestration, ...chunkMetadata } = chunk;
             extraMetadata = { ...extraMetadata, ...chunkMetadata };
             id = chunk.id ?? id;
             object = chunk.object ?? object;
             created = chunk.created ?? created;
             model = chunk.model ?? model;
             usage = chunk.usage ?? usage;
+            orchestration.observe(chunk.orchestration);
             for (const choice of chunk.choices ?? []) {
                 finishReason = choice.finish_reason ?? finishReason;
                 const delta = choice.delta;
                 const text = chatContentText(delta.content);
                 if (text) {
-                    content += text;
-                    onTextDelta?.(text);
+                    // In orchestrated turns, only the final-answer stage feeds the reply
+                    // text; intermediate stages are recorded but not concatenated here.
+                    if (orchestration.emitText(text)) {
+                        content += text;
+                        onTextDelta?.(text);
+                    }
                 }
                 for (const raw of delta.tool_calls ?? []) {
                     const index = typeof raw.index === "number" ? raw.index : 0;
@@ -304,6 +311,12 @@ export class JoyTokenClient {
                     calls.set(index, call);
                 }
             }
+        }
+        const orchestrationResult = orchestration.result();
+        // When the gateway orchestrated the turn but never emitted a final stage,
+        // fall back to concatenating every stage so no content is silently dropped.
+        if (orchestrationResult && !content) {
+            content = orchestrationResult.stages.map((stage) => stage.content).join("");
         }
         return {
             ...extraMetadata,
@@ -330,6 +343,7 @@ export class JoyTokenClient {
                     finish_reason: finishReason,
                 }],
             ...(usage === undefined ? {} : { usage }),
+            ...(orchestrationResult === undefined ? {} : { orchestration: orchestrationResult }),
         };
     }
     async *streamChatCompletionWire(request, declarations) {
@@ -348,6 +362,7 @@ export class JoyTokenClient {
         });
         try {
             for await (const event of readSSE(activeRequest.response)) {
+                throwIfChatResponseError(event, activeRequest.response);
                 yield normalizeChatCompletionChunk(event);
             }
         }
@@ -699,6 +714,24 @@ export class JoyTokenClient {
             activeRequest.cleanup();
         }
     }
+    /**
+     * Non-streaming Chat requests need the same mid-payload error guard as the
+     * streaming path: the Gateway can answer HTTP 200 with an
+     * `{"error":{...},"choices":[]}` envelope (for example a failed orchestration
+     * run). requestJSON alone would surface that as an empty response, so detect
+     * the error envelope on the raw body before returning.
+     */
+    async requestChatCompletionJSON(init) {
+        const activeRequest = await this.requestRaw(this.chatCompletionsUrl, init);
+        try {
+            const body = (await activeRequest.response.json());
+            throwIfChatResponseError(body, activeRequest.response);
+            return body;
+        }
+        finally {
+            activeRequest.cleanup();
+        }
+    }
     async requestRaw(url, init, auth = "bearer") {
         for (let attempt = 0;; attempt++) {
             const controller = this.timeoutMs !== undefined && this.timeoutMs > 0 ? new AbortController() : undefined;
@@ -777,6 +810,111 @@ export class JoyTokenClient {
                 output.set("Authorization", `Bearer ${this.apiKey}`);
         }
         return output;
+    }
+}
+/**
+ * OrchestrationAggregator tracks orchestration metadata across the chunks of a
+ * single streamed turn. It decides which text deltas belong to the final
+ * answer, records every sub-task's aggregated content, and emits progress
+ * events (plan announcement and per-sub-task transitions).
+ */
+class OrchestrationAggregator {
+    onEvent;
+    seen = false;
+    planEmitted = false;
+    plan;
+    stages = [];
+    stageByKey = new Map();
+    currentKey;
+    currentIsFinal = false;
+    constructor(onEvent) {
+        this.onEvent = onEvent;
+    }
+    /** Records orchestration metadata from one chunk, emitting events on change. */
+    observe(info) {
+        if (!info)
+            return;
+        this.seen = true;
+        if (Array.isArray(info.plan) && !this.planEmitted) {
+            this.plan = info.plan;
+            this.planEmitted = true;
+            this.onEvent?.({
+                type: "plan",
+                plan: info.plan,
+                ...(info.phase === undefined ? {} : { phase: info.phase }),
+            });
+        }
+        if (info.task_id === undefined && info.task_seq === undefined && info.title === undefined) {
+            return;
+        }
+        const key = info.task_id ?? (info.task_seq !== undefined ? `seq:${info.task_seq}` : "");
+        const isFinal = info.task_id === ORCHESTRATION_FINAL_TASK_ID;
+        let stage = this.stageByKey.get(key);
+        if (!stage) {
+            stage = {
+                content: "",
+                ...(info.task_id === undefined ? {} : { task_id: info.task_id }),
+                ...(info.task_seq === undefined ? {} : { task_seq: info.task_seq }),
+                ...(info.title === undefined ? {} : { title: info.title }),
+                ...(info.task_status === undefined ? {} : { task_status: info.task_status }),
+            };
+            this.stageByKey.set(key, stage);
+            this.stages.push(stage);
+        }
+        else {
+            if (info.task_status !== undefined)
+                stage.task_status = info.task_status;
+            if (info.title !== undefined && stage.title === undefined)
+                stage.title = info.title;
+            if (info.task_seq !== undefined && stage.task_seq === undefined)
+                stage.task_seq = info.task_seq;
+        }
+        if (key !== this.currentKey) {
+            this.currentKey = key;
+            this.currentIsFinal = isFinal;
+            this.onEvent?.({
+                type: "stage",
+                final: isFinal,
+                ...(info.task_id === undefined ? {} : { task_id: info.task_id }),
+                ...(info.task_seq === undefined ? {} : { task_seq: info.task_seq }),
+                ...(info.task_status === undefined ? {} : { task_status: info.task_status }),
+                ...(info.title === undefined ? {} : { title: info.title }),
+            });
+        }
+        else if (info.task_status !== undefined) {
+            this.onEvent?.({
+                type: "stage",
+                final: isFinal,
+                ...(info.task_id === undefined ? {} : { task_id: info.task_id }),
+                ...(info.task_seq === undefined ? {} : { task_seq: info.task_seq }),
+                task_status: info.task_status,
+                ...(info.title === undefined ? {} : { title: info.title }),
+            });
+        }
+    }
+    /**
+     * Records a text delta against the active sub-task and reports whether it
+     * should feed the user-facing reply. Non-orchestrated turns always emit;
+     * orchestrated turns emit only the final-answer stage.
+     */
+    emitText(text) {
+        if (!this.seen)
+            return true;
+        if (this.currentKey !== undefined) {
+            const stage = this.stageByKey.get(this.currentKey);
+            if (stage)
+                stage.content += text;
+        }
+        return this.currentIsFinal;
+    }
+    /** Returns the aggregated orchestration summary, or undefined if none seen. */
+    result() {
+        if (!this.seen)
+            return undefined;
+        return {
+            ...(this.plan === undefined ? {} : { plan: this.plan }),
+            stages: this.stages,
+        };
     }
 }
 function chatContentText(content) {
@@ -909,6 +1047,33 @@ function responseInputContentText(content) {
     if (!Array.isArray(content))
         return "";
     return content.map((part) => String(part.text ?? "")).join("");
+}
+/**
+ * The Gateway can surface a failure (for example an orchestration run that
+ * fails server-side) as an HTTP 200 payload shaped like
+ * `{"error":{"message":...,"type":...},"choices":[]}` — both as a mid-stream SSE
+ * event and as a non-streaming response body. Without this guard such payloads
+ * would be normalized into an empty chunk / empty response and the caller would
+ * silently receive a truncated or empty reply. Detect the error envelope and
+ * raise so the failure surfaces, mirroring the Responses protocol behavior.
+ */
+function throwIfChatResponseError(value, response) {
+    if (!isRecord(value))
+        return;
+    const error = value.error;
+    if (error === undefined || error === null)
+        return;
+    const detail = isRecord(error) ? error : { message: error };
+    const message = typeof detail.message === "string" && detail.message.length > 0
+        ? detail.message
+        : "JoyToken Chat returned an error event";
+    throw new JoyTokenAPIError(`JoyToken Chat stream error: ${message}`, {
+        status: response.status,
+        code: classifyStatus(response.status),
+        responseHeaders: response.headers,
+        body: error,
+        requestId: extractRequestId(response.headers),
+    });
 }
 /**
  * The Gateway may interleave metadata-only or usage-only SSE events with Chat

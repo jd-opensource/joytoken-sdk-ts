@@ -1168,3 +1168,138 @@ test("all local default tools execute inside a temporary workspace and side effe
   await deniedShell.client.chat.completions.create({ model: "auto", messages: [] });
   assert.match(deniedShell.requests[1]?.body.messages.at(-1)?.content, /no shell permission handler configured/);
 });
+
+function orchestratedStream(): Response {
+  const chunks = [
+    // Plan announcement (no content yet).
+    '{"id":"orc1","model":"m","orchestration":{"phase":"plan","plan":[{"seq":1,"task_id":"search","title":"Search"},{"seq":2,"task_id":"__final__","title":"Answer"}]},"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+    // Search stage emits intermediate content that must NOT leak into the reply.
+    '{"id":"orc1","model":"m","orchestration":{"task_id":"search","task_seq":1,"task_status":"RUNNING","title":"Search"},"choices":[{"index":0,"delta":{"content":"searching..."},"finish_reason":null}]}',
+    '{"id":"orc1","model":"m","orchestration":{"task_id":"search","task_seq":1,"task_status":"DONE","title":"Search"},"choices":[{"index":0,"delta":{},"finish_reason":null}]}',
+    // Final stage content feeds the user-facing reply.
+    '{"id":"orc1","model":"m","orchestration":{"task_id":"__final__","task_seq":2,"task_status":"RUNNING","title":"Answer"},"choices":[{"index":0,"delta":{"content":"final "},"finish_reason":null}]}',
+    '{"id":"orc1","model":"m","orchestration":{"task_id":"__final__","task_seq":2,"task_status":"DONE","title":"Answer"},"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}',
+  ];
+  const body = chunks.map((chunk) => `data: ${chunk}\n\n`).join("") + "data: [DONE]\n\n";
+  return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+}
+
+test("Chat runStream keeps only the final orchestration stage in the reply", async () => {
+  const { client } = mockClient([orchestratedStream()]);
+  const deltas: string[] = [];
+  const events: any[] = [];
+  const response = await client.chat.completions.runStream(
+    { model: "auto", messages: [] },
+    { onTextDelta: (delta) => deltas.push(delta), onOrchestrationEvent: (event) => events.push(event) },
+  );
+  // Only the final-answer stage text reaches the user-facing reply.
+  assert.equal(response.choices[0]?.message.content, "final answer");
+  assert.deepEqual(deltas, ["final ", "answer"]);
+  // Orchestration summary carries the plan plus every sub-task stage.
+  assert.deepEqual(response.orchestration?.plan?.map((item) => item.task_id), ["search", "__final__"]);
+  assert.deepEqual(response.orchestration?.stages.map((stage) => stage.task_id), ["search", "__final__"]);
+  const searchStage = response.orchestration?.stages.find((stage) => stage.task_id === "search");
+  const finalStage = response.orchestration?.stages.find((stage) => stage.task_id === "__final__");
+  assert.equal(searchStage?.content, "searching...");
+  assert.equal(searchStage?.task_status, "DONE");
+  assert.equal(finalStage?.content, "final answer");
+  // Progress callbacks expose the plan then each stage transition.
+  const planEvents = events.filter((event) => event.type === "plan");
+  const stageEvents = events.filter((event) => event.type === "stage");
+  assert.equal(planEvents.length, 1);
+  assert.equal(planEvents[0].plan.length, 2);
+  assert.ok(stageEvents.some((event) => event.task_id === "search" && event.final === false));
+  assert.ok(stageEvents.some((event) => event.task_id === "__final__" && event.final === true));
+  assert.ok(stageEvents.some((event) => event.task_id === "search" && event.task_status === "DONE"));
+});
+
+test("Chat runStream falls back to all stages when no final stage is emitted", async () => {
+  const body = [
+    'data: {"id":"orc2","model":"m","orchestration":{"task_id":"search","task_seq":1,"task_status":"RUNNING"},"choices":[{"index":0,"delta":{"content":"partial "},"finish_reason":null}]}\n\n',
+    'data: {"id":"orc2","model":"m","orchestration":{"task_id":"plan","task_seq":2,"task_status":"RUNNING"},"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n",
+  ].join("");
+  const { client } = mockClient([new Response(body, { headers: { "Content-Type": "text/event-stream" } })]);
+  const response = await client.chat.completions.runStream({ model: "auto", messages: [] });
+  // No __final__ stage: concatenate every stage so nothing is silently dropped.
+  assert.equal(response.choices[0]?.message.content, "partial answer");
+  assert.equal(response.orchestration?.stages.length, 2);
+});
+
+test("Chat runStream leaves non-orchestrated turns unchanged", async () => {
+  const body = [
+    'data: {"id":"plain1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hello "},"finish_reason":null}]}\n\n',
+    'data: {"id":"plain1","model":"m","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n",
+  ].join("");
+  const { client } = mockClient([new Response(body, { headers: { "Content-Type": "text/event-stream" } })]);
+  const deltas: string[] = [];
+  const events: any[] = [];
+  const response = await client.chat.completions.runStream(
+    { model: "auto", messages: [] },
+    { onTextDelta: (delta) => deltas.push(delta), onOrchestrationEvent: (event) => events.push(event) },
+  );
+  assert.equal(response.choices[0]?.message.content, "hello world");
+  assert.deepEqual(deltas, ["hello ", "world"]);
+  // Without orchestration metadata the summary and progress callbacks stay absent.
+  assert.equal(response.orchestration, undefined);
+  assert.equal(events.length, 0);
+});
+
+test("Chat stream surfaces a mid-stream error event instead of yielding an empty chunk", async () => {
+  // The Gateway reports an orchestration failure as an error envelope with empty choices.
+  const body = [
+    'data: {"id":"err1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}\n\n',
+    'data: {"error":{"message":"orchestration run failed: STORE_ERROR","type":"orchestration_error"},"choices":[]}\n\n',
+    "data: [DONE]\n\n",
+  ].join("");
+  const { client } = mockClient([new Response(body, { headers: { "Content-Type": "text/event-stream" } })]);
+  await assert.rejects(
+    async () => {
+      for await (const _chunk of client.chat.completions.stream({ model: "auto", messages: [] })) {
+        // Drain the stream; the error event must throw before completion.
+      }
+    },
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.match(error.message, /orchestration run failed: STORE_ERROR/);
+      assert.deepEqual((error.body as { type?: string }).type, "orchestration_error");
+      return true;
+    },
+  );
+});
+
+test("Chat runStream rejects when the orchestration stream returns an error event", async () => {
+  const body = [
+    'data: {"id":"err2","model":"m","orchestration":{"phase":"plan","plan":[]},"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+    'data: {"error":{"message":"orchestration_error: context deadline exceeded"},"choices":[]}\n\n',
+    "data: [DONE]\n\n",
+  ].join("");
+  const { client } = mockClient([new Response(body, { headers: { "Content-Type": "text/event-stream" } })]);
+  await assert.rejects(
+    () => client.chat.completions.runStream({ model: "auto", messages: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.match(error.message, /context deadline exceeded/);
+      return true;
+    },
+  );
+});
+
+test("Chat non-streaming create rejects when the JSON body carries an error envelope", async () => {
+  // A non-streaming orchestration failure arrives as HTTP 200 with an error envelope and empty choices.
+  const body = JSON.stringify({
+    error: { message: "orchestration run failed: STORE_ERROR", type: "orchestration_error" },
+    choices: [],
+  });
+  const { client } = mockClient([new Response(body, { headers: { "Content-Type": "application/json" } })]);
+  await assert.rejects(
+    () => client.chat.completions.create({ model: "auto", messages: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof JoyTokenAPIError);
+      assert.match(error.message, /orchestration run failed: STORE_ERROR/);
+      assert.deepEqual((error.body as { type?: string }).type, "orchestration_error");
+      return true;
+    },
+  );
+});
