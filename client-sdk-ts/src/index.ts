@@ -1,4 +1,5 @@
 export { JoyTokenAPIError, JoyTokenClient } from "./client.js";
+export { ORCHESTRATION_FINAL_TASK_ID } from "./types.js";
 export type {
   ErrorCode,
   JoyTokenErrorContext,
@@ -33,6 +34,13 @@ export type {
   ModelListResponse,
   ModelMetadata,
   ModelMetadataResponse,
+  OrchestrationEvent,
+  OrchestrationInfo,
+  OrchestrationPlanEvent,
+  OrchestrationPlanItem,
+  OrchestrationResult,
+  OrchestrationStage,
+  OrchestrationStageEvent,
   Pricing,
   PricingResponse,
   PricingSku,
