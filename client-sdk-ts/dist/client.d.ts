@@ -1,4 +1,4 @@
-import type { ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamRequest, OrchestrationResult, ImageGenerationRequest, ImageGenerationResponse, JoyTokenClientOptions, ListModelsOptions, MessageRequest, MessageResponse, MessageStreamEvent, ModelListResponse, ModelMetadataResponse, PricingResponse, Response as JoyTokenResponse, ResponseRequest, ResponseStreamEvent, ToolRunStreamOptions } from "./types.js";
+import type { ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamRequest, OrchestrationResult, ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse, JoyTokenClientOptions, ListModelsOptions, MessageRequest, MessageResponse, MessageStreamEvent, ModelListResponse, ModelMetadataResponse, PricingResponse, Response as JoyTokenResponse, ResponseRequest, ResponseStreamEvent, ToolRunStreamOptions } from "./types.js";
 export type ErrorCode = "rate_limited" | "server_error" | "timeout" | "network" | "invalid_request" | "authentication" | "permission" | "not_found" | "unknown";
 export type JoyTokenProtocol = "chat" | "responses" | "messages";
 export interface JoyTokenToolCallDiagnostic {
@@ -94,6 +94,7 @@ export declare class JoyTokenClient {
     };
     readonly images: {
         generate: (request: ImageGenerationRequest) => Promise<ImageGenerationResponse>;
+        edit: (request: ImageEditRequest) => Promise<ImageGenerationResponse>;
     };
     readonly pricing: {
         retrieve: () => Promise<PricingResponse>;
@@ -134,6 +135,7 @@ export declare class JoyTokenClient {
     private streamMessage;
     private runMessageStreamExplicit;
     private generateImage;
+    private editImage;
     private listModels;
     private getModelMetadata;
     private getPricing;

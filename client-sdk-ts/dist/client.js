@@ -108,6 +108,7 @@ export class JoyTokenClient {
     };
     images = {
         generate: (request) => this.generateImage(request),
+        edit: (request) => this.editImage(request),
     };
     pricing = {
         retrieve: () => this.getPricing(),
@@ -543,6 +544,24 @@ export class JoyTokenClient {
         this.requireAutoModel(request.model);
         this.requireAPIKey();
         return this.requestJSON(`${this.openAIBaseUrl}/images/generations`, {
+            method: "POST",
+            body: JSON.stringify(request),
+        });
+    }
+    async editImage(request) {
+        this.requireAutoModel(request.model);
+        this.requireAPIKey();
+        const image = request.image;
+        const hasImage = Array.isArray(image)
+            ? image.length > 0 && image.every((item) => typeof item === "string" && item.length > 0)
+            : typeof image === "string" && image.length > 0;
+        if (!hasImage) {
+            throw new Error("JoyToken image edit requires image to be a non-empty string or a non-empty array of non-empty strings.");
+        }
+        if (typeof request.prompt !== "string" || request.prompt.length === 0) {
+            throw new Error("JoyToken image edit requires a non-empty prompt.");
+        }
+        return this.requestJSON(`${this.openAIBaseUrl}/images/edits`, {
             method: "POST",
             body: JSON.stringify(request),
         });
@@ -1437,7 +1456,7 @@ function trimTrailingSlash(value) {
 }
 function deriveOpenAIBaseUrl(value) {
     let base = trimTrailingSlash(value);
-    base = base.replace(/\/openai\/v1\/(?:chat\/completions|responses|images\/generations)$/i, "/openai/v1");
+    base = base.replace(/\/openai\/v1\/(?:chat\/completions|responses|images\/generations|images\/edits)$/i, "/openai/v1");
     base = base.replace(/\/anthropic\/v1(?:\/messages)?$/i, "");
     base = base.replace(/(?:\/openai\/v1){2,}$/i, "/openai/v1");
     return /\/openai\/v1$/i.test(base) ? base : `${base}/openai/v1`;

@@ -500,6 +500,16 @@ export interface ImageGenerationRequest {
     output_format?: string;
     [key: string]: unknown;
 }
+export interface ImageEditRequest {
+    model: JoyTokenModel;
+    prompt: string;
+    image: string | string[];
+    n?: number;
+    size?: string;
+    user?: string;
+    response_format?: "url" | "b64_json";
+    [key: string]: unknown;
+}
 export interface GeneratedImage {
     url?: string;
     b64_json?: string;
