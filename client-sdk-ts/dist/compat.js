@@ -42,6 +42,7 @@ export function chatResponseToMessage(response) {
             id: call.id,
             name: call.function.name,
             input: parseObject(call.function.arguments),
+            ...(call.thought_signature === undefined ? {} : { thought_signature: call.thought_signature }),
             ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
         });
     }
@@ -141,6 +142,9 @@ export async function* chatStreamToMessages(chunks) {
                 const partial = typeof fn.arguments === "string" ? fn.arguments : "";
                 if (partial)
                     call.arguments += partial;
+                if (typeof raw.thought_signature === "string" && raw.thought_signature) {
+                    call.thought_signature = raw.thought_signature;
+                }
                 call.extra_content = mergeOpaqueObject(call.extra_content, raw.extra_content);
             }
         }
@@ -158,6 +162,7 @@ export async function* chatStreamToMessages(chunks) {
                 id: call.id,
                 name: call.name,
                 input: {},
+                ...(call.thought_signature === undefined ? {} : { thought_signature: call.thought_signature }),
                 ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
             },
         };
@@ -198,6 +203,7 @@ function appendAnthropicInput(messages, role, content) {
             id: block.id ?? "",
             type: "function",
             function: { name: block.name ?? "", arguments: JSON.stringify(block.input ?? {}) },
+            ...(typeof block.thought_signature === "string" ? { thought_signature: block.thought_signature } : {}),
             ...(block.extra_content === undefined ? {} : { extra_content: block.extra_content }),
         }));
         messages.push({ role: "assistant", content: text || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });

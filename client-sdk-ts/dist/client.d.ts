@@ -1,9 +1,11 @@
-import type { ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamRequest, ImageGenerationRequest, ImageGenerationResponse, JoyTokenClientOptions, ListModelsOptions, MessageRequest, MessageResponse, MessageStreamEvent, ModelListResponse, ModelMetadataResponse, PricingResponse, Response as JoyTokenResponse, ResponseRequest, ResponseStreamEvent, ToolRunStreamOptions } from "./types.js";
+import type { ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamRequest, OrchestrationResult, ImageGenerationRequest, ImageGenerationResponse, JoyTokenClientOptions, ListModelsOptions, MessageRequest, MessageResponse, MessageStreamEvent, ModelListResponse, ModelMetadataResponse, PricingResponse, Response as JoyTokenResponse, ResponseRequest, ResponseStreamEvent, ToolRunStreamOptions } from "./types.js";
 export type ErrorCode = "rate_limited" | "server_error" | "timeout" | "network" | "invalid_request" | "authentication" | "permission" | "not_found" | "unknown";
 export type JoyTokenProtocol = "chat" | "responses" | "messages";
 export interface JoyTokenToolCallDiagnostic {
     readonly id: string;
     readonly name: string;
+    /** Whether the provider returned a top-level thought_signature that must be echoed on continuation. */
+    readonly hasThoughtSignature: boolean;
     /** Whether the Gateway supplied opaque provider metadata for this call. */
     readonly hasExtraContent: boolean;
 }
@@ -156,4 +158,15 @@ export declare class JoyTokenClient {
     private requestRaw;
     private headers;
 }
+/**
+ * Normalizes a *non-streaming* orchestration response into an
+ * {@link OrchestrationResult}, mirroring what the streaming aggregator produces.
+ *
+ * It reads the top-level `plan` and `metadata` arrays plus the per-sub-task
+ * content carried in `choices[].message.content`, merging metadata into stages
+ * by matching `task_id`/`task_seq`. Returns undefined when the response shows no
+ * orchestration signal (no plan, no metadata array), so callers can safely skip
+ * non-orchestrated turns.
+ */
+export declare function parseOrchestrationResponse(response: ChatCompletionResponse | undefined): OrchestrationResult | undefined;
 //# sourceMappingURL=client.d.ts.map

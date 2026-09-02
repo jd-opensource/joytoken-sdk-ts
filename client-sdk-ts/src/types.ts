@@ -23,6 +23,16 @@ export interface ToolCall {
     name: string;
     arguments: string;
   };
+  /**
+   * Opaque, provider-specific reasoning token that some upstreams (notably
+   * Gemini via the gateway's Chat Completions endpoint) return at the top level
+   * of the tool_call object, as a sibling of id/type/function. It MUST be echoed
+   * back verbatim on the continuation turn or the provider rejects the request
+   * with a 503, so it is captured here rather than dropped during
+   * (de)serialization. This is distinct from the nested
+   * `extra_content.google.thought_signature` shape and both may be present.
+   */
+  thought_signature?: string;
   /** Opaque provider extension data that must be replayed unchanged on tool continuations. */
   extra_content?: Record<string, unknown>;
 }
@@ -144,6 +154,20 @@ export interface ChatCompletionResponse {
    * `plan` is the announced plan when available.
    */
   orchestration?: OrchestrationResult;
+  /**
+   * Top-level plan on a *non-streaming* orchestration response. Some gateways
+   * return the announced plan here instead of inside a streamed planning chunk.
+   * When present, {@link parseOrchestrationResponse} folds it into
+   * {@link ChatCompletionResponse.orchestration}.
+   */
+  plan?: OrchestrationPlanItem[];
+  /**
+   * Top-level per-sub-task metadata on a *non-streaming* orchestration
+   * response, one entry per sub-task. Pairs with {@link plan} and is folded
+   * into {@link ChatCompletionResponse.orchestration} by
+   * {@link parseOrchestrationResponse}.
+   */
+  metadata?: OrchestrationTaskMetadata[];
   [key: string]: unknown;
 }
 
@@ -180,6 +204,46 @@ export interface OrchestrationInfo {
   phase?: string;
   /** Present on planning chunks: the ordered list of sub-tasks to run. */
   plan?: OrchestrationPlanItem[];
+  [key: string]: unknown;
+}
+
+/**
+ * Per-sub-task metadata attached at the top level of a *non-streaming*
+ * orchestration response. Unlike streaming turns (where each chunk carries an
+ * {@link OrchestrationInfo}), an orchestrating gateway may instead return a
+ * single aggregated response with a top-level `metadata` array, one entry per
+ * sub-task. Fields mirror {@link OrchestrationInfo} plus billing/routing hints.
+ */
+/** Per-sub-task latency breakdown reported on non-streaming orchestration metadata. */
+export interface OrchestrationLatency {
+  /** Milliseconds until the sub-task produced its first token. */
+  first_token_ms?: number;
+  /** Total streaming duration of the sub-task in milliseconds. */
+  stream_ms?: number;
+  [key: string]: unknown;
+}
+
+export interface OrchestrationTaskMetadata {
+  /** Identifier of the sub-task (e.g. "weather", "__planner__", "__final__"). */
+  task_id?: string;
+  /** Ordinal of the sub-task within the plan; the planner is 0. */
+  task_seq?: number;
+  /** Lifecycle status of the sub-task, e.g. "DONE". */
+  task_status?: string;
+  /** Human-readable title of the sub-task (absent on the planner entry). */
+  title?: string;
+  /** Model that produced this sub-task, when reported. */
+  model?: string;
+  /** Service tier used for this sub-task, e.g. "economy"/"standard". */
+  tier?: string;
+  /** Latency breakdown for this sub-task, when reported. */
+  latency?: OrchestrationLatency;
+  /** Billing/usage breakdown for this sub-task, when reported. */
+  billing?: Record<string, unknown>;
+  /** Billing account identifier, when reported. */
+  billing_id?: string;
+  /** Router/orchestration tags, e.g. ["orchestration"], ["search"]. */
+  tag?: string[];
   [key: string]: unknown;
 }
 
@@ -319,6 +383,8 @@ export interface ResponseOutputItem {
   results?: unknown[];
   /** Opaque provider extension data associated with this output item. */
   extra_content?: Record<string, unknown>;
+  /** Top-level opaque reasoning token that must be echoed verbatim on continuation (e.g. Gemini via the gateway). */
+  thought_signature?: string;
   [key: string]: unknown;
 }
 

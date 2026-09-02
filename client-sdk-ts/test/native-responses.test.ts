@@ -21,6 +21,7 @@ function response(options: {
   callId?: string;
   arguments?: string;
   extraContent?: Record<string, unknown>;
+  thoughtSignature?: string;
   output?: ResponseOutputItem[];
 } = {}): JoyTokenResponse {
   const output = options.output ?? (options.toolName
@@ -32,6 +33,7 @@ function response(options: {
         name: options.toolName,
         arguments: options.arguments ?? "{}",
         ...(options.extraContent === undefined ? {} : { extra_content: options.extraContent }),
+        ...(options.thoughtSignature === undefined ? {} : { thought_signature: options.thoughtSignature }),
       }]
     : [{
         id: `msg_${options.id ?? "resp_1"}`,
@@ -175,6 +177,48 @@ test("native Responses run preserves opaque function_call metadata in replay and
   assert.deepEqual(requests[1]?.body.tools, requests[0]?.body.tools);
 });
 
+test("native Responses run replays a top-level thought_signature verbatim on the continuation turn", async () => {
+  const echo = defineTool({ name: "echo", execute: () => "echoed" });
+  const { client, requests } = mockClient([
+    response({ toolName: "echo", arguments: '{"text":"hi"}', thoughtSignature: "gemini-top-level-sig" }),
+    response({ id: "final-sig", text: "done" }),
+  ], { tools: [echo] });
+
+  await client.responses.run({ model: "auto", input: "echo" });
+
+  assert.equal(requests.length, 2);
+  const replayed = requests[1]?.body.input.at(-2);
+  assert.equal(replayed?.type, "function_call");
+  assert.equal(replayed?.thought_signature, "gemini-top-level-sig");
+});
+
+test("native Responses run preserves both top-level thought_signature and extra_content together", async () => {
+  const echo = defineTool({ name: "echo", execute: () => "echoed" });
+  const { client, requests } = mockClient([
+    response({ toolName: "echo", thoughtSignature: "top-sig", extraContent: opaqueExtraContent }),
+    response({ id: "final-both", text: "done" }),
+  ], { tools: [echo] });
+
+  await client.responses.run({ model: "auto", input: "echo" });
+
+  const replayed = requests[1]?.body.input.at(-2);
+  assert.equal(replayed?.thought_signature, "top-sig");
+  assert.deepEqual(replayed?.extra_content, opaqueExtraContent);
+});
+
+test("native Responses calls without a thought_signature do not synthesize an empty field", async () => {
+  const echo = defineTool({ name: "echo", execute: () => "echoed" });
+  const { client, requests } = mockClient([
+    response({ toolName: "echo" }),
+    response({ text: "done" }),
+  ], { tools: [echo] });
+
+  await client.responses.run({ model: "auto", input: "echo" });
+
+  const replayed = requests[1]?.body.input.at(-2);
+  assert.equal("thought_signature" in replayed, false);
+});
+
 test("native Responses run reports the failed continuation without retrying the tool", async () => {
   let executions = 0;
   const echo = defineTool({ name: "echo", execute: () => { executions += 1; return "echoed"; } });
@@ -200,7 +244,7 @@ test("native Responses run reports the failed continuation without retrying the 
         phase: "tool_continuation",
         requestNumber: 2,
         toolStep: 1,
-        toolCalls: [{ id: "call_1", name: "echo", hasExtraContent: true }],
+        toolCalls: [{ id: "call_1", name: "echo", hasExtraContent: true, hasThoughtSignature: false }],
       });
       return true;
     },
@@ -337,7 +381,7 @@ test("native Responses runStream annotates a failed continuation and executes on
         phase: "tool_continuation",
         requestNumber: 2,
         toolStep: 1,
-        toolCalls: [{ id: "call_stream_error", name: "echo", hasExtraContent: false }],
+        toolCalls: [{ id: "call_stream_error", name: "echo", hasExtraContent: false, hasThoughtSignature: false }],
       });
       return true;
     },
