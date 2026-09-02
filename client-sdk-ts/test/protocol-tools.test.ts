@@ -745,6 +745,47 @@ test("Anthropic tool_use round-trip preserves opaque extra_content in both direc
   );
 });
 
+test("Anthropic tool_use round-trip preserves a top-level thought_signature in both directions", async () => {
+  const first = mockClient([
+    chatResponse({ toolName: "lookup", arguments: '{"id":"42"}', thoughtSignature: "gemini-top-level-sig" }),
+  ]);
+  const message = await first.client.messages.create({
+    model: "auto",
+    max_tokens: 32,
+    messages: [{ role: "user", content: "find" }],
+    tools: [{ name: "lookup", input_schema: { type: "object" } }],
+  });
+  const toolUse = message.content.find((block) => block.type === "tool_use");
+  assert.equal(toolUse?.thought_signature, "gemini-top-level-sig");
+
+  const continuation = mockClient([chatResponse({ content: "done" })]);
+  await continuation.client.messages.create({
+    model: "auto",
+    max_tokens: 32,
+    messages: [
+      { role: "assistant", content: message.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: toolUse?.id, content: "record" }] },
+    ],
+    tools: [{ name: "lookup", input_schema: { type: "object" } }],
+  });
+  assert.equal(
+    continuation.requests[0]?.body.messages[0]?.tool_calls[0]?.thought_signature,
+    "gemini-top-level-sig",
+  );
+});
+
+test("Anthropic tool_use without a thought_signature does not synthesize an empty field", async () => {
+  const messages = mockClient([chatResponse({ toolName: "echo" })]);
+  const response = await messages.client.messages.create({
+    model: "auto",
+    max_tokens: 32,
+    messages: [],
+    tools: [{ name: "echo", input_schema: { type: "object" } }],
+  });
+  const toolUse = response.content.find((block) => block.type === "tool_use")!;
+  assert.equal("thought_signature" in toolUse, false);
+});
+
 test("Anthropic run executes once and replays opaque tool_use metadata on the Chat continuation", async () => {
   let executions = 0;
   let executionExtraContent: unknown;

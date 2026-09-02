@@ -16,7 +16,7 @@ function fixture(content: unknown): ChatCompletionResponse {
       { seq: 2, task_id: "__final__", title: "Answer" },
     ],
     metadata: [
-      { task_id: "search", task_seq: 1, task_status: "DONE", title: "Search", model: "m-a", tier: "std", latency: 120 },
+      { task_id: "search", task_seq: 1, task_status: "DONE", title: "Search", model: "m-a", tier: "std", latency: { first_token_ms: 40, stream_ms: 120 } },
       { task_id: "__final__", task_seq: 2, task_status: "DONE", title: "Answer", model: "m-b" },
     ],
   } as ChatCompletionResponse;
@@ -80,7 +80,7 @@ test("parseOrchestrationResponse ignores a bookkeeping-only metadata row", () =>
     id: "chat",
     model: "m",
     choices: [{ index: 0, message: { role: "assistant", content: "Singapore is..." }, finish_reason: "stop" }],
-    metadata: [{ model: "m-a", tier: "std", latency: 90 } as never],
+    metadata: [{ model: "m-a", tier: "std", latency: { stream_ms: 90 } } as never],
   } as ChatCompletionResponse;
   assert.equal(parseOrchestrationResponse(resp), undefined);
 });

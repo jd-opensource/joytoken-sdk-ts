@@ -383,6 +383,8 @@ export interface ResponseOutputItem {
   results?: unknown[];
   /** Opaque provider extension data associated with this output item. */
   extra_content?: Record<string, unknown>;
+  /** Top-level opaque reasoning token that must be echoed verbatim on continuation (e.g. Gemini via the gateway). */
+  thought_signature?: string;
   [key: string]: unknown;
 }
 

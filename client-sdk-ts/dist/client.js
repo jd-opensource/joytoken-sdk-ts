@@ -1044,7 +1044,16 @@ export function parseOrchestrationResponse(response) {
             stage.title = meta.title;
     };
     // Prefer content-derived stages when the payload carried per-sub-task content.
-    if (contentStages.length > 0 && (contentStages.length > 1 || metadata.length <= 1 || contentStages[0]?.task_id !== undefined)) {
+    // A single content entry still counts as real per-sub-task content (not the
+    // plain final-answer text) when it carries a task_id OR a title — the latter
+    // guards the case where the gateway returns one aggregated content object with
+    // only { content, title } alongside multiple metadata rows, which would
+    // otherwise fall through to the metadata-only branch and drop the content.
+    if (contentStages.length > 0 &&
+        (contentStages.length > 1 ||
+            metadata.length <= 1 ||
+            contentStages[0]?.task_id !== undefined ||
+            contentStages[0]?.title !== undefined)) {
         for (const partial of contentStages) {
             const stage = { content: partial.content ?? "" };
             if (partial.task_id !== undefined)
