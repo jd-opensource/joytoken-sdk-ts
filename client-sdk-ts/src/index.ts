@@ -16,6 +16,7 @@ export type {
   ChatTool,
   CatalogOption,
   GeneratedImage,
+  ImageEditRequest,
   ImageGenerationRequest,
   ImageGenerationResponse,
   JoyTokenClientOptions,
