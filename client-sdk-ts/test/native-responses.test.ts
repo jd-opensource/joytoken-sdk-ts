@@ -200,7 +200,7 @@ test("native Responses run reports the failed continuation without retrying the 
         phase: "tool_continuation",
         requestNumber: 2,
         toolStep: 1,
-        toolCalls: [{ id: "call_1", name: "echo", hasExtraContent: true }],
+        toolCalls: [{ id: "call_1", name: "echo", hasExtraContent: true, hasThoughtSignature: false }],
       });
       return true;
     },
@@ -337,7 +337,7 @@ test("native Responses runStream annotates a failed continuation and executes on
         phase: "tool_continuation",
         requestNumber: 2,
         toolStep: 1,
-        toolCalls: [{ id: "call_stream_error", name: "echo", hasExtraContent: false }],
+        toolCalls: [{ id: "call_stream_error", name: "echo", hasExtraContent: false, hasThoughtSignature: false }],
       });
       return true;
     },

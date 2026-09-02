@@ -81,7 +81,7 @@ The default endpoint is `https://api.joytokens.ai`; requests time out after 60 s
 
 Tool ownership is exclusive. An explicit `request.tools` value, including `[]`, is sent without SDK defaults. Otherwise Client-registered tools are used alone. Only when neither exists are local SDK defaults injected and allowed to auto-run. Every tool-loop turn carries the same resolved tools and request options exactly once. `create` and raw `stream` never execute user tools; call `run`/`executeTools` or the streaming `runStream`/`executeToolsStream` entry points to execute Client-registered handlers. Responses tools stay in the native flat shape, and `function_call_output` items are appended to native Responses input. Responses hosted defaults are disabled unless `defaultBuiltinTools: true` is set; hosted `file_search` must be supplied by the caller with its `vector_store_ids`.
 
-`ToolCall.extra_content` is opaque provider extension data. SDK-managed `run`/`executeTools` loops preserve it across Chat Completions, Responses, and Anthropic Messages continuations, including streamed tool calls whose extension objects arrive in multiple chunks. For example, Gemini may return `extra_content.google.thought_signature`; the SDK neither interprets nor manufactures that value. Custom loops must replay the complete returned `ToolCall` (or the complete Responses `function_call` / Messages `tool_use` item) instead of rebuilding only `id` and `function`, otherwise provider-required continuation metadata can be lost. When the provider does not return `extra_content`, the SDK does not add an empty object.
+`ToolCall.thought_signature` and `ToolCall.extra_content` are both opaque provider extension data that the SDK preserves but never interprets or manufactures. `thought_signature` is a top-level field sibling to `id`/`type`/`function`: Gemini returns it there via the Gateway Chat Completions endpoint, and a continuation that drops it is rejected upstream (provider 503). This is distinct from the nested `extra_content.google.thought_signature` form; the two can coexist and both must be replayed. SDK-managed `run`/`executeTools` loops preserve both across Chat Completions, Responses, and Anthropic Messages continuations, including streamed tool calls whose top-level signature or extension objects arrive across multiple chunks. Custom loops must replay the complete returned `ToolCall` (or the complete Responses `function_call` / Messages `tool_use` item) instead of rebuilding only `id` and `function`, otherwise provider-required continuation metadata can be lost. When the provider does not return `thought_signature` or `extra_content`, the SDK does not synthesize an empty field.
 
 All model requests require `model: "auto"`; concrete model IDs are rejected before a network request is sent.
 
@@ -140,7 +140,8 @@ try {
     console.error(error.status, error.requestId, error.message, error.body, error.context);
     // context.phase is "initial_request", "tool_continuation", or
     // "repair_continuation". A tool continuation also reports whether each
-    // returned ToolCall included opaque extra_content.
+    // returned ToolCall included opaque extra_content and/or a top-level
+    // thought_signature.
   }
 }
 ```

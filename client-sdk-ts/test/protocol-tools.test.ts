@@ -25,6 +25,7 @@ function chatResponse(options: {
   toolName?: string;
   arguments?: string;
   extraContent?: Record<string, unknown>;
+  thoughtSignature?: string;
   finishReason?: string;
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 } = {}): ChatCompletionResponse {
@@ -33,6 +34,7 @@ function chatResponse(options: {
         id: "call_1",
         type: "function" as const,
         function: { name: options.toolName, arguments: options.arguments ?? "{}" },
+        ...(options.thoughtSignature === undefined ? {} : { thought_signature: options.thoughtSignature }),
         ...(options.extraContent === undefined ? {} : { extra_content: options.extraContent }),
       }]
     : undefined;
@@ -233,6 +235,72 @@ test("Chat run replays opaque ToolCall extra_content exactly once without changi
   assert.deepEqual(requests[1]?.body.messages.at(-2)?.tool_calls[0]?.extra_content, opaqueExtraContent);
 });
 
+test("Chat run replays top-level thought_signature verbatim on the continuation turn", async () => {
+  const echo = defineTool({ name: "echo", execute: () => "echoed" });
+  const { client, requests } = mockClient([
+    chatResponse({ toolName: "echo", arguments: '{"text":"hi"}', thoughtSignature: "gemini-top-level-sig" }),
+    chatResponse({ id: "chat-final", content: "done" }),
+  ], { tools: [echo] });
+
+  await client.chat.completions.run({ model: "auto", messages: [{ role: "user", content: "echo" }] });
+
+  assert.equal(requests.length, 2);
+  const replayed = requests[1]?.body.messages.at(-2)?.tool_calls[0];
+  // The top-level signature (sibling of id/type/function) must be echoed back
+  // verbatim, otherwise Gemini rejects the continuation with a 503.
+  assert.equal(replayed?.thought_signature, "gemini-top-level-sig");
+});
+
+test("Chat run preserves both top-level thought_signature and nested extra_content together", async () => {
+  const echo = defineTool({ name: "echo", execute: () => "echoed" });
+  const { client, requests } = mockClient([
+    chatResponse({
+      toolName: "echo",
+      arguments: "{}",
+      thoughtSignature: "top-sig",
+      extraContent: opaqueExtraContent,
+    }),
+    chatResponse({ id: "chat-final", content: "done" }),
+  ], { tools: [echo] });
+
+  await client.chat.completions.run({ model: "auto", messages: [{ role: "user", content: "echo" }] });
+
+  const replayed = requests[1]?.body.messages.at(-2)?.tool_calls[0];
+  assert.equal(replayed?.thought_signature, "top-sig");
+  assert.deepEqual(replayed?.extra_content, opaqueExtraContent);
+});
+
+test("tool calls without thought_signature do not synthesize an empty field", async () => {
+  const echo = defineTool({ name: "echo", execute: () => "echoed" });
+  const { client, requests } = mockClient([
+    chatResponse({ toolName: "echo", arguments: "{}" }),
+    chatResponse({ id: "chat-final", content: "done" }),
+  ], { tools: [echo] });
+
+  await client.chat.completions.run({ model: "auto", messages: [{ role: "user", content: "echo" }] });
+
+  const replayed = requests[1]?.body.messages.at(-2)?.tool_calls[0];
+  assert.equal("thought_signature" in replayed, false);
+});
+
+test("Chat runStream aggregates a top-level thought_signature streamed across deltas", async () => {
+  const echo = defineTool({ name: "echo", execute: () => "echoed" });
+  const streamed = new Response(
+    'data: {"id":"s1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_s","type":"function","function":{"name":"echo","arguments":"{}"},"thought_signature":"streamed-sig"}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n',
+    { status: 200, headers: { "Content-Type": "text/event-stream" } },
+  );
+  const final = new Response(
+    'data: {"id":"s2","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    { status: 200, headers: { "Content-Type": "text/event-stream" } },
+  );
+  const { client, requests } = mockClient([streamed, final], { tools: [echo] });
+
+  await client.chat.completions.runStream({ model: "auto", messages: [{ role: "user", content: "echo" }] });
+
+  const replayed = requests[1]?.body.messages.at(-2)?.tool_calls[0];
+  assert.equal(replayed?.thought_signature, "streamed-sig");
+});
+
 test("Chat run annotates continuation HTTP errors without retrying or re-executing tools", async () => {
   let executions = 0;
   const echo = defineTool({
@@ -268,7 +336,7 @@ test("Chat run annotates continuation HTTP errors without retrying or re-executi
         phase: "tool_continuation",
         requestNumber: 2,
         toolStep: 1,
-        toolCalls: [{ id: "call_1", name: "echo", hasExtraContent: true }],
+        toolCalls: [{ id: "call_1", name: "echo", hasExtraContent: true, hasThoughtSignature: false }],
       });
       return true;
     },
@@ -431,7 +499,7 @@ test("Chat runStream annotates continuation errors without another tool executio
         phase: "tool_continuation",
         requestNumber: 2,
         toolStep: 1,
-        toolCalls: [{ id: "call_stream_error", name: "echo", hasExtraContent: true }],
+        toolCalls: [{ id: "call_stream_error", name: "echo", hasExtraContent: true, hasThoughtSignature: false }],
       });
       return true;
     },
@@ -729,7 +797,7 @@ test("Anthropic run identifies a failed tool continuation without changing tool 
         phase: "tool_continuation",
         requestNumber: 2,
         toolStep: 1,
-        toolCalls: [{ id: "call_1", name: "lookup", hasExtraContent: true }],
+        toolCalls: [{ id: "call_1", name: "lookup", hasExtraContent: true, hasThoughtSignature: false }],
       });
       return true;
     },
@@ -1068,7 +1136,7 @@ test("Anthropic runStream reports continuation context and executes the tool onc
         phase: "tool_continuation",
         requestNumber: 2,
         toolStep: 1,
-        toolCalls: [{ id: "call_anthropic_error", name: "lookup", hasExtraContent: false }],
+        toolCalls: [{ id: "call_anthropic_error", name: "lookup", hasExtraContent: false, hasThoughtSignature: false }],
       });
       return true;
     },

@@ -1,4 +1,5 @@
 export { JoyTokenAPIError, JoyTokenClient } from "./client.js";
+export { parseOrchestrationResponse } from "./client.js";
 export { ORCHESTRATION_FINAL_TASK_ID } from "./types.js";
 export { calculator, dateTime, defineTool, parseToolArguments, safeExecuteTool, stringifyToolResult, toChatTool, toMessageTool, toResponseTool, evalExpression, MaxArgBytes, } from "./tools.js";
 export { fileRead, fileWrite, listDir, fileSearch, absRoot, DefaultFileMaxBytes, DefaultSearchLimit, } from "./file-tools.js";

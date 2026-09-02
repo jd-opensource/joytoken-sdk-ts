@@ -10,6 +10,7 @@ import type {
   OrchestrationPlanItem,
   OrchestrationResult,
   OrchestrationStage,
+  OrchestrationTaskMetadata,
   ImageGenerationRequest,
   ImageGenerationResponse,
   JoyTokenClientOptions,
@@ -104,6 +105,8 @@ export type JoyTokenProtocol = "chat" | "responses" | "messages";
 export interface JoyTokenToolCallDiagnostic {
   readonly id: string;
   readonly name: string;
+  /** Whether the provider returned a top-level thought_signature that must be echoed on continuation. */
+  readonly hasThoughtSignature: boolean;
   /** Whether the Gateway supplied opaque provider metadata for this call. */
   readonly hasExtraContent: boolean;
 }
@@ -475,6 +478,7 @@ export class JoyTokenClient {
       type: "function";
       name: string;
       arguments: string;
+      thought_signature?: string;
       extra_content?: Record<string, unknown>;
     }>();
     for await (const chunk of this.streamChatCompletionWire(request, declarations)) {
@@ -515,6 +519,9 @@ export class JoyTokenClient {
           if (raw.type === "function") call.type = raw.type;
           if (typeof fn.name === "string") call.name += fn.name;
           if (typeof fn.arguments === "string") call.arguments += fn.arguments;
+          if (typeof raw.thought_signature === "string" && raw.thought_signature) {
+            call.thought_signature = raw.thought_signature;
+          }
           call.extra_content = mergeOpaqueObject(call.extra_content, raw.extra_content);
           calls.set(index, call);
         }
@@ -543,6 +550,7 @@ export class JoyTokenClient {
                   id: call.id,
                   type: call.type,
                   function: { name: call.name, arguments: call.arguments },
+                  ...(call.thought_signature === undefined ? {} : { thought_signature: call.thought_signature }),
                   ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
                 })),
               }
@@ -1022,7 +1030,16 @@ export class JoyTokenClient {
     try {
       const body = (await activeRequest.response.json()) as unknown;
       throwIfChatResponseError(body, activeRequest.response);
-      return body as ChatCompletionResponse;
+      const response = body as ChatCompletionResponse;
+      // Non-streaming orchestration fallback: gateways that return an
+      // aggregated response (top-level plan/metadata) don't populate
+      // `orchestration`. Fold it in so both streaming and non-streaming turns
+      // expose the same OrchestrationResult shape.
+      if (response.orchestration === undefined) {
+        const orchestration = parseOrchestrationResponse(response);
+        if (orchestration !== undefined) response.orchestration = orchestration;
+      }
+      return response;
     } finally {
       activeRequest.cleanup();
     }
@@ -1215,6 +1232,151 @@ class OrchestrationAggregator {
   }
 }
 
+/** Coerces an unknown value to a trimmed string, or undefined when unusable. */
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * Extracts stage records from a non-streaming orchestration payload. The
+ * gateway may serialize per-sub-task content as (a) an array of objects, (b) a
+ * JSON string encoding such an array, or (c) OpenAI-style content parts. This
+ * normalizes all three into partial {@link OrchestrationStage} records.
+ */
+function extractContentStages(content: unknown): Array<Partial<OrchestrationStage>> {
+  let value: unknown = content;
+  if (typeof content === "string") {
+    const raw = content;
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      try {
+        value = JSON.parse(trimmed);
+      } catch {
+        return [{ content: raw }];
+      }
+    } else {
+      return [{ content: raw }];
+    }
+  }
+
+  const items = Array.isArray(value) ? value : [value];
+  const stages: Array<Partial<OrchestrationStage>> = [];
+  for (const item of items) {
+    if (typeof item === "string") {
+      stages.push({ content: item });
+      continue;
+    }
+    if (typeof item !== "object" || item === null) continue;
+    const record = item as Record<string, unknown>;
+    // OpenAI-style content parts: { type: "text", text: "..." }.
+    const text = asString(record.content) ?? asString(record.text);
+    const stage: Partial<OrchestrationStage> = { content: text ?? "" };
+    if (typeof record.task_id === "string") stage.task_id = record.task_id;
+    if (typeof record.task_seq === "number") stage.task_seq = record.task_seq;
+    if (typeof record.task_status === "string") stage.task_status = record.task_status;
+    if (typeof record.title === "string") stage.title = record.title;
+    stages.push(stage);
+  }
+  return stages;
+}
+
+/**
+ * Normalizes a *non-streaming* orchestration response into an
+ * {@link OrchestrationResult}, mirroring what the streaming aggregator produces.
+ *
+ * It reads the top-level `plan` and `metadata` arrays plus the per-sub-task
+ * content carried in `choices[].message.content`, merging metadata into stages
+ * by matching `task_id`/`task_seq`. Returns undefined when the response shows no
+ * orchestration signal (no plan, no metadata array), so callers can safely skip
+ * non-orchestrated turns.
+ */
+export function parseOrchestrationResponse(
+  response: ChatCompletionResponse | undefined,
+): OrchestrationResult | undefined {
+  if (!response) return undefined;
+  const plan = Array.isArray(response.plan) ? response.plan : undefined;
+  const metadata: OrchestrationTaskMetadata[] = Array.isArray(response.metadata) ? response.metadata : [];
+
+  // A metadata entry only signals orchestration when it identifies a sub-task
+  // (carries a task_id, task_seq, or title). Plain (non-orchestrated) turns can
+  // still carry a single bookkeeping metadata row — e.g. model/billing info with
+  // task_id/task_seq/title all null — which must NOT be treated as a sub-task.
+  const hasSubTaskMetadata = metadata.some(
+    (m) => typeof m.task_id === "string" || typeof m.task_seq === "number" || typeof m.title === "string",
+  );
+  // No orchestration signal at all: no plan and no real sub-task metadata. This
+  // keeps the non-streaming fallback aligned with the streaming aggregator,
+  // which surfaces no orchestration for plain chat turns.
+  if (plan === undefined && !hasSubTaskMetadata) return undefined;
+
+  const contentStages = extractContentStages(response.choices?.[0]?.message?.content);
+
+  // Index metadata by task_id, task_seq, and title for merging into stages.
+  // Title matching is required because per-sub-task content entries often carry
+  // only `content` + `title` (no task_id/task_seq), while the metadata array
+  // carries the identifiers; matching on title is the only way to reunite them.
+  const metaById = new Map<string, OrchestrationTaskMetadata>();
+  const metaBySeq = new Map<number, OrchestrationTaskMetadata>();
+  const metaByTitle = new Map<string, OrchestrationTaskMetadata>();
+  for (const meta of metadata) {
+    if (typeof meta.task_id === "string") metaById.set(meta.task_id, meta);
+    if (typeof meta.task_seq === "number") metaBySeq.set(meta.task_seq, meta);
+    if (typeof meta.title === "string" && meta.title.length > 0 && !metaByTitle.has(meta.title)) {
+      metaByTitle.set(meta.title, meta);
+    }
+  }
+
+  const stages: OrchestrationStage[] = [];
+  const usedMeta = new Set<OrchestrationTaskMetadata>();
+
+  const mergeMeta = (stage: OrchestrationStage): void => {
+    const meta =
+      (stage.task_id !== undefined ? metaById.get(stage.task_id) : undefined) ??
+      (stage.task_seq !== undefined ? metaBySeq.get(stage.task_seq) : undefined) ??
+      (stage.title !== undefined ? metaByTitle.get(stage.title) : undefined);
+    if (!meta) return;
+    usedMeta.add(meta);
+    if (stage.task_id === undefined && typeof meta.task_id === "string") stage.task_id = meta.task_id;
+    if (stage.task_seq === undefined && typeof meta.task_seq === "number") stage.task_seq = meta.task_seq;
+    if (stage.task_status === undefined && typeof meta.task_status === "string") stage.task_status = meta.task_status;
+    if (stage.title === undefined && typeof meta.title === "string") stage.title = meta.title;
+  };
+
+  // Prefer content-derived stages when the payload carried per-sub-task content.
+  if (contentStages.length > 0 && (contentStages.length > 1 || metadata.length <= 1 || contentStages[0]?.task_id !== undefined)) {
+    for (const partial of contentStages) {
+      const stage: OrchestrationStage = { content: partial.content ?? "" };
+      if (partial.task_id !== undefined) stage.task_id = partial.task_id;
+      if (partial.task_seq !== undefined) stage.task_seq = partial.task_seq;
+      if (partial.task_status !== undefined) stage.task_status = partial.task_status;
+      if (partial.title !== undefined) stage.title = partial.title;
+      mergeMeta(stage);
+      stages.push(stage);
+    }
+  }
+
+  // Emit any metadata entries that had no matching content stage, so every
+  // announced sub-task is represented even when its content was empty. Skip
+  // orchestration control placeholders (e.g. the planner entry) that carry no
+  // title, since they are not real sub-tasks and the streaming aggregator does
+  // not surface them as stages either.
+  for (const meta of metadata) {
+    if (usedMeta.has(meta)) continue;
+    if (typeof meta.title !== "string" || meta.title.length === 0) continue;
+    const stage: OrchestrationStage = { content: "" };
+    if (typeof meta.task_id === "string") stage.task_id = meta.task_id;
+    if (typeof meta.task_seq === "number") stage.task_seq = meta.task_seq;
+    if (typeof meta.task_status === "string") stage.task_status = meta.task_status;
+    stage.title = meta.title;
+    stages.push(stage);
+  }
+
+  return {
+    ...(plan === undefined ? {} : { plan }),
+    stages,
+  };
+}
+
 function chatContentText(content: ChatMessage["content"] | unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -1247,6 +1409,7 @@ function requestErrorContext(
           toolCalls: toolCalls.map((call) => ({
             id: call.id,
             name: call.function?.name ?? "",
+            hasThoughtSignature: typeof call.thought_signature === "string" && call.thought_signature.length > 0,
             hasExtraContent: call.extra_content !== undefined,
           })),
         }),
@@ -1298,6 +1461,7 @@ function responseFunctionCallToToolCall(call: ResponseOutputItem): ToolCall {
     id: call.call_id ?? call.id ?? "",
     type: "function",
     function: { name: call.name ?? "", arguments: call.arguments ?? "" },
+    ...(typeof call.thought_signature === "string" ? { thought_signature: call.thought_signature } : {}),
     ...(call.extra_content === undefined ? {} : { extra_content: call.extra_content }),
   };
 }
@@ -1334,6 +1498,7 @@ function responseInputToContextMessages(input: ResponseInputItem[], instructions
         id: item.call_id ?? item.id ?? "",
         type: "function",
         function: { name: item.name ?? "", arguments: item.arguments ?? "" },
+        ...(typeof item.thought_signature === "string" ? { thought_signature: item.thought_signature } : {}),
         ...(item.extra_content === undefined ? {} : { extra_content: item.extra_content }),
       };
       const previous = messages.at(-1);
